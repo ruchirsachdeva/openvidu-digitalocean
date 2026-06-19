@@ -1,13 +1,55 @@
 variable "doToken" {
-  description = "DigitalOcean API token"
+  description = "Temporary DigitalOcean provisioning token used by Terraform"
   type        = string
   sensitive   = true
+}
+
+variable "autoscalerToken" {
+  description = "Scoped DigitalOcean runtime token used only by the media-node autoscaler and draining nodes"
+  type        = string
+  sensitive   = true
+}
+
+variable "awsRegion" {
+  description = "AWS region containing the Route53 and SSM operational resources"
+  type        = string
+  default     = "ap-south-1"
+}
+
+variable "route53ZoneId" {
+  description = "Route53 hosted-zone ID used when domainName is configured"
+  type        = string
+  default     = ""
+}
+
+variable "sshAllowedCidrs" {
+  description = "CIDR ranges allowed to SSH to OpenVidu nodes"
+  type        = list(string)
+
+  validation {
+    condition = length(var.sshAllowedCidrs) > 0 && alltrue([
+      for cidr in var.sshAllowedCidrs :
+      try(can(cidrhost(cidr, 0)) && tonumber(split("/", cidr)[1]) > 0, false)
+    ])
+    error_message = "sshAllowedCidrs must contain valid IPv4 or IPv6 CIDRs and must not allow the entire internet."
+  }
 }
 
 variable "region" {
   description = "DigitalOcean region where resources will be created"
   type        = string
   default     = "ams3"
+}
+
+variable "vpcIpRange" {
+  description = "Private CIDR for the OpenVidu VPC; it must not overlap any VPC in the DigitalOcean account"
+  type        = string
+  default     = "10.10.10.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.vpcIpRange, 0)) && !strcontains(var.vpcIpRange, ":")
+    error_message = "vpcIpRange must be a valid IPv4 CIDR."
+  }
 }
 
 variable "stackName" {
@@ -79,34 +121,51 @@ variable "mediaNodeInstanceType" {
   default     = "s-4vcpu-8gb"
 }
 
-variable "initialNumberOfMediaNodes" {
-  description = "Number of media nodes to create on initial deployment"
-  type        = number
-  default     = 1
-}
-
 variable "minNumberOfMediaNodes" {
   description = "Minimum number of media nodes (autoscaler will never scale below this)"
   type        = number
   default     = 1
+
+  validation {
+    condition     = var.minNumberOfMediaNodes >= 1 && floor(var.minNumberOfMediaNodes) == var.minNumberOfMediaNodes
+    error_message = "minNumberOfMediaNodes must be a positive whole number."
+  }
 }
 
 variable "maxNumberOfMediaNodes" {
   description = "Maximum number of media nodes (autoscaler will never scale above this)"
   type        = number
   default     = 5
+
+  validation {
+    condition = (
+      var.maxNumberOfMediaNodes >= var.minNumberOfMediaNodes &&
+      floor(var.maxNumberOfMediaNodes) == var.maxNumberOfMediaNodes
+    )
+    error_message = "maxNumberOfMediaNodes must be a whole number at least as large as minNumberOfMediaNodes."
+  }
 }
 
 variable "scaleTargetCPU" {
   description = "Target average CPU percentage for autoscaling. Scale out above this, scale in below 70% of this."
   type        = number
   default     = 50
+
+  validation {
+    condition     = var.scaleTargetCPU > 0 && var.scaleTargetCPU <= 100
+    error_message = "scaleTargetCPU must be greater than 0 and no greater than 100."
+  }
 }
 
 variable "fixedNumberOfMediaNodes" {
   description = "Fixed number of media nodes to create (0 = use autoscaling)"
   type        = number
   default     = 0
+
+  validation {
+    condition     = var.fixedNumberOfMediaNodes >= 0 && floor(var.fixedNumberOfMediaNodes) == var.fixedNumberOfMediaNodes
+    error_message = "fixedNumberOfMediaNodes must be zero or a positive whole number."
+  }
 }
 
 variable "openviduLicense" {
@@ -122,6 +181,17 @@ variable "rtcEngine" {
   validation {
     condition     = contains(["pion", "mediasoup"], var.rtcEngine)
     error_message = "rtcEngine must be one of: pion, mediasoup"
+  }
+}
+
+variable "enabledModules" {
+  description = "Comma-separated OpenVidu modules enabled on the master node"
+  type        = string
+  default     = "observability,openviduMeet"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9,._-]+$", var.enabledModules))
+    error_message = "enabledModules must be a comma-separated list of OpenVidu module names."
   }
 }
 

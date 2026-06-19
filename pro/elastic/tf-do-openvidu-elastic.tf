@@ -5,7 +5,7 @@ resource "random_id" "bucket_suffix" { byte_length = 5 }
 resource "digitalocean_vpc" "openvidu_vpc" {
   name     = "${var.stackName}-vpc"
   region   = var.region
-  ip_range = "10.10.10.0/24"
+  ip_range = var.vpcIpRange
 }
 
 resource "digitalocean_tag" "media_node_tag" {
@@ -25,7 +25,7 @@ resource "digitalocean_firewall" "master_firewall" {
   inbound_rule {
     protocol         = "tcp"
     port_range       = "22"
-    source_addresses = ["0.0.0.0/0", "::/0"]
+    source_addresses = var.sshAllowedCidrs
   }
 
   inbound_rule {
@@ -72,12 +72,14 @@ resource "digitalocean_firewall" "master_firewall" {
 resource "digitalocean_firewall" "media_firewall" {
   name = "${var.stackName}-media-firewall"
 
-  tags = [digitalocean_tag.media_node_tag.name]
+  # A draining node remains internet-facing until its watcher finishes a graceful
+  # shutdown. Keep both lifecycle tags covered so scale-in never removes its firewall.
+  tags = [digitalocean_tag.media_node_tag.name, digitalocean_tag.draining_tag.name]
 
   inbound_rule {
     protocol         = "tcp"
     port_range       = "22"
-    source_addresses = ["0.0.0.0/0", "::/0"]
+    source_addresses = var.sshAllowedCidrs
   }
 
   inbound_rule {
@@ -191,7 +193,7 @@ resource "digitalocean_firewall" "media_to_master_firewall" {
 resource "digitalocean_firewall" "master_to_media_firewall" {
   name = "${var.stackName}-master-to-media-firewall"
 
-  tags = [digitalocean_tag.media_node_tag.name]
+  tags = [digitalocean_tag.media_node_tag.name, digitalocean_tag.draining_tag.name]
 
   inbound_rule {
     protocol         = "tcp"
@@ -271,24 +273,74 @@ resource "digitalocean_droplet" "openvidu_media_nodes" {
 resource "null_resource" "cleanup_media_nodes" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
   triggers = {
+    # Retained only to avoid replacing the existing cleanup guard during token
+    # rotation. Destruction uses the current scoped token exported by the wrapper.
     do_token     = var.doToken
     media_tag    = digitalocean_tag.media_node_tag.name
     draining_tag = digitalocean_tag.draining_tag.name
   }
 
+  lifecycle {
+    ignore_changes = [triggers["do_token"]]
+  }
+
   provisioner "local-exec" {
     when    = destroy
     command = <<-EOT
-      curl -s -X DELETE \
-        -H "Authorization: Bearer ${self.triggers.do_token}" \
-        -H "Content-Type: application/json" \
-        "https://api.digitalocean.com/v2/droplets?tag_name=${self.triggers.media_tag}"
-      echo "Deleted all media node droplets"
-      curl -s -X DELETE \
-        -H "Authorization: Bearer ${self.triggers.do_token}" \
-        -H "Content-Type: application/json" \
-        "https://api.digitalocean.com/v2/droplets?tag_name=${self.triggers.draining_tag}"
-      echo "Deleted all draining node droplets"
+      set -eu
+
+      TOKEN="$${COURSEULTRA_DO_AUTOSCALER_TOKEN:-}"
+      [ -n "$TOKEN" ] || {
+        echo "ERROR: use courseultra-terraform.sh so media cleanup receives the scoped autoscaler token" >&2
+        exit 1
+      }
+
+      for COMMAND in curl jq sleep; do
+        command -v "$COMMAND" >/dev/null 2>&1 || {
+          echo "ERROR: $COMMAND is required for media cleanup" >&2
+          exit 1
+        }
+      done
+
+      # The Function resource is an explicit dependency, so Terraform removes
+      # its schedule before reaching this cleanup. An activation already in
+      # progress can still run for 120 seconds; wait it out before deleting the
+      # nodes it could otherwise recreate behind this provisioner's back.
+      sleep 130
+
+      delete_and_verify_tag() {
+        TAG="$1"
+        curl -fsS -X DELETE \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          "https://api.digitalocean.com/v2/droplets?tag_name=$TAG" >/dev/null
+
+        ATTEMPT=1
+        while [ "$ATTEMPT" -le 30 ]; do
+          RESPONSE=$(curl -fsS \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://api.digitalocean.com/v2/droplets?tag_name=$TAG&per_page=200")
+          COUNT=$(printf '%s' "$RESPONSE" | jq -er '
+            if (.droplets | type) == "array" then
+              .droplets | length
+            else
+              error("DigitalOcean response does not contain a droplets array")
+            end
+          ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Verified removal of droplets tagged $TAG"
+            return 0
+          fi
+          sleep 2
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+
+        echo "ERROR: droplets tagged $TAG still exist after cleanup" >&2
+        return 1
+      }
+
+      delete_and_verify_tag "${self.triggers.media_tag}"
+      delete_and_verify_tag "${self.triggers.draining_tag}"
     EOT
   }
 }
@@ -298,10 +350,16 @@ resource "null_resource" "cleanup_media_nodes" {
 resource "null_resource" "deploy_autoscaler_function" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
   triggers = {
-    code_hash  = sha256(local.autoscaler_function_code)
+    code_hash = sha256(local.autoscaler_function_code)
+    # Retained for a no-downtime transition from the upstream resource shape.
+    # Runtime cleanup uses the current wrapper-provided credential instead.
     do_token   = var.doToken
     stack_name = var.stackName
     region     = var.region
+  }
+
+  lifecycle {
+    ignore_changes = [triggers["do_token"]]
   }
 
   provisioner "local-exec" {
@@ -325,11 +383,11 @@ resource "null_resource" "deploy_autoscaler_function" {
 
       # Helper: curl with verbose error on failure
       do_curl() {
-        HTTP_BODY=$(curl -s -w "\n__HTTP_CODE__%%{http_code}" "$@")
+        HTTP_BODY=$(curl -sS -w "\n__HTTP_CODE__%%{http_code}" "$@")
         HTTP_CODE=$(printf '%s' "$HTTP_BODY" | tail -1 | sed 's/__HTTP_CODE__//')
-        BODY=$(printf '%s' "$HTTP_BODY" | head -n -1)
+        BODY=$(printf '%s' "$HTTP_BODY" | sed '$d')
         if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-          echo "ERROR: curl $* returned HTTP $HTTP_CODE: $BODY" >&2
+          echo "ERROR: DigitalOcean API request returned HTTP $HTTP_CODE: $BODY" >&2
           exit 1
         fi
         printf '%s' "$BODY"
@@ -337,7 +395,17 @@ resource "null_resource" "deploy_autoscaler_function" {
 
       # === 1. Find or create Functions namespace ===
       NS_LIST=$(do_curl -H "$AUTH" "$DO_API/functions/namespaces")
-      echo "Namespaces response: $NS_LIST"
+      printf '%s' "$NS_LIST" | jq -e \
+        'has("namespaces")
+          and ((.namespaces == null)
+            or ((.namespaces | type) == "array"
+              and all(.namespaces[];
+                type == "object"
+                and (.label | type) == "string"
+                and (.namespace | type) == "string")))' >/dev/null || {
+        echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
+        exit 1
+      }
       NS_ID=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
         '[(.namespaces // [])[] | select(.label == $l)] | .[0].namespace // empty')
 
@@ -346,7 +414,6 @@ resource "null_resource" "deploy_autoscaler_function" {
         NS_RESP=$(do_curl -X POST -H "$AUTH" -H "$CT" \
           -d "{\"region\":\"${var.region}\",\"label\":\"$LABEL\"}" \
           "$DO_API/functions/namespaces")
-        echo "Create namespace response: $NS_RESP"
         NS_ID=$(printf '%s' "$NS_RESP"    | jq -r '.namespace.namespace // empty')
         NS_UUID=$(printf '%s' "$NS_RESP"  | jq -r '.namespace.uuid // empty')
         API_HOST=$(printf '%s' "$NS_RESP" | jq -r '.namespace.api_host // empty')
@@ -365,7 +432,7 @@ resource "null_resource" "deploy_autoscaler_function" {
       [ -n "$API_KEY" ]  || { echo "ERROR: could not get API key";       exit 1; }
 
       # OpenWhisk Basic Auth = base64("uuid:key")
-      OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 -w0)
+      OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 | tr -d '\n')
 
       # === 2. Create / update OpenWhisk package ===
       do_curl -X PUT \
@@ -410,16 +477,54 @@ resource "null_resource" "deploy_autoscaler_function" {
   provisioner "local-exec" {
     when    = destroy
     command = <<-EOT
+      set -eu
+
       DO_API="https://api.digitalocean.com/v2"
-      TOKEN="${self.triggers.do_token}"
+      TOKEN="$${COURSEULTRA_DO_PROVISIONING_TOKEN:-}"
       LABEL="${self.triggers.stack_name}-autoscaler"
       TRIGGER="${self.triggers.stack_name}-autoscale-cron"
+
+      [ -n "$TOKEN" ] || {
+        echo "ERROR: use courseultra-terraform.sh so Functions cleanup receives a current provisioning token" >&2
+        exit 1
+      }
+
+      for COMMAND in curl jq base64; do
+        command -v "$COMMAND" >/dev/null 2>&1 || {
+          echo "ERROR: $COMMAND is required for Functions cleanup" >&2
+          exit 1
+        }
+      done
+
+      delete_allow_missing() {
+        AUTH_HEADER="$1"
+        URL="$2"
+        HTTP_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' -X DELETE \
+          -H "$AUTH_HEADER" "$URL")
+        case "$HTTP_CODE" in
+          2??|404) return 0 ;;
+          *)
+            echo "ERROR: DELETE $URL returned HTTP $HTTP_CODE" >&2
+            return 1
+            ;;
+        esac
+      }
 
       echo "=== Destroying autoscaler function ==="
       echo "Looking for namespace with label: $LABEL"
 
-      NS_LIST=$(curl -sf -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces" || echo '{"namespaces":[]}')
-      echo "Namespaces: $NS_LIST"
+      NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
+      printf '%s' "$NS_LIST" | jq -e \
+        'has("namespaces")
+          and ((.namespaces == null)
+            or ((.namespaces | type) == "array"
+              and all(.namespaces[];
+                type == "object"
+                and (.label | type) == "string"
+                and (.namespace | type) == "string")))' >/dev/null || {
+        echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
+        exit 1
+      }
       NS_ID=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
         '[(.namespaces // [])[] | select(.label == $l)] | .[0].namespace // empty')
 
@@ -429,42 +534,66 @@ resource "null_resource" "deploy_autoscaler_function" {
       fi
 
       echo "Found namespace: $NS_ID"
-      NS_DETAIL=$(curl -sf -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces/$NS_ID" || echo '{}')
+      NS_DETAIL=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces/$NS_ID")
       NS_UUID=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.uuid // empty')
       API_HOST=$(printf '%s' "$NS_DETAIL" | jq -r '.namespace.api_host // empty')
       API_KEY=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.key // empty')
 
       # Delete cron trigger
       echo "Deleting trigger $TRIGGER ..."
-      curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-        "$DO_API/functions/namespaces/$NS_ID/triggers/$TRIGGER" || true
+      delete_allow_missing "Authorization: Bearer $TOKEN" \
+        "$DO_API/functions/namespaces/$NS_ID/triggers/$TRIGGER"
 
       # Delete action + package via OpenWhisk API
       if [ -n "$API_HOST" ] && [ -n "$NS_UUID" ] && [ -n "$API_KEY" ]; then
-        OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 -w0)
+        OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 | tr -d '\n')
         echo "Deleting action autoscaler/check ..."
-        curl -s -X DELETE -H "Authorization: Basic $OW_AUTH" \
-          "$API_HOST/api/v1/namespaces/_/actions/autoscaler/check" || true
+        delete_allow_missing "Authorization: Basic $OW_AUTH" \
+          "$API_HOST/api/v1/namespaces/_/actions/autoscaler/check"
         echo "Deleting package autoscaler ..."
-        curl -s -X DELETE -H "Authorization: Basic $OW_AUTH" \
-          "$API_HOST/api/v1/namespaces/_/packages/autoscaler" || true
+        delete_allow_missing "Authorization: Basic $OW_AUTH" \
+          "$API_HOST/api/v1/namespaces/_/packages/autoscaler"
       else
-        echo "WARN: missing OpenWhisk credentials, skipping action/package deletion"
+        echo "OpenWhisk credentials unavailable; namespace deletion will remove its contents"
       fi
 
       # Delete the namespace itself
       echo "Deleting namespace $NS_ID ..."
-      DEL_RESP=$(curl -s -w "\n__HTTP_CODE__%%{http_code}" -X DELETE \
-        -H "Authorization: Bearer $TOKEN" \
-        "$DO_API/functions/namespaces/$NS_ID")
-      DEL_CODE=$(printf '%s' "$DEL_RESP" | tail -1 | sed 's/__HTTP_CODE__//')
-      echo "Namespace delete HTTP $DEL_CODE"
+      delete_allow_missing "Authorization: Bearer $TOKEN" \
+        "$DO_API/functions/namespaces/$NS_ID"
 
-      echo "=== Autoscaler function destroyed ==="
+      ATTEMPT=1
+      while [ "$ATTEMPT" -le 30 ]; do
+        NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
+        printf '%s' "$NS_LIST" | jq -e \
+          'has("namespaces")
+            and ((.namespaces == null)
+              or ((.namespaces | type) == "array"
+                and all(.namespaces[];
+                  type == "object"
+                  and (.label | type) == "string"
+                  and (.namespace | type) == "string")))' >/dev/null || {
+          echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
+          exit 1
+        }
+        MATCHES=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
+          '[(.namespaces // [])[] | select(.label == $l)] | length')
+        if [ "$MATCHES" -eq 0 ]; then
+          echo "Verified namespace removal: $LABEL"
+          echo "=== Autoscaler function destroyed ==="
+          exit 0
+        fi
+        sleep 2
+        ATTEMPT=$((ATTEMPT + 1))
+      done
+
+      echo "ERROR: Functions namespace $LABEL still exists after cleanup" >&2
+      exit 1
     EOT
   }
 
   depends_on = [
+    null_resource.cleanup_media_nodes,
     digitalocean_droplet.openvidu_master_node,
     digitalocean_vpc.openvidu_vpc,
     digitalocean_tag.media_node_tag,
@@ -490,10 +619,11 @@ resource "digitalocean_spaces_key" "openvidu_space_key" {
 
 locals {
   install_script_master = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
+umask 077
 
-OPENVIDU_VERSION=main
+OPENVIDU_VERSION=3.7.0
 DOMAIN=
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
@@ -505,6 +635,7 @@ echo 1 > /usr/local/bin/openvidu_install_counter.txt
 
 mkdir -p /opt/openvidu
 touch /opt/openvidu/secrets.env
+chmod 600 /opt/openvidu/secrets.env
 
 # Get IPs using DO metadata
 PUBLIC_IP=$(curl -s http://169.254.169.254/metadata/v1/floating_ip/ipv4/ip_address)
@@ -512,6 +643,7 @@ if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "null" ]; then
   PUBLIC_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
 fi
 MASTER_NODE_PRIVATE_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address)
+MASTER_NODE_ID=$(curl -fsS http://169.254.169.254/metadata/v1/id)
 
 if [[ "${var.domainName}" == "" ]]; then
   [ ! -d "/usr/share/openvidu" ] && mkdir -p /usr/share/openvidu
@@ -544,18 +676,28 @@ DASHBOARD_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save DASHBOARD_ADMIN_
 DASHBOARD_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate DASHBOARD_ADMIN_PASSWORD)"
 GRAFANA_ADMIN_USERNAME="$(/usr/local/bin/store_secret.sh save GRAFANA_ADMIN_USERNAME "grafanaadmin")"
 GRAFANA_ADMIN_PASSWORD="$(/usr/local/bin/store_secret.sh generate GRAFANA_ADMIN_PASSWORD)"
-ENABLED_MODULES="$(/usr/local/bin/store_secret.sh save ENABLED_MODULES "observability,openviduMeet")"
+ENABLED_MODULES="$(/usr/local/bin/store_secret.sh save ENABLED_MODULES "${var.enabledModules}")"
 LIVEKIT_API_KEY="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_KEY "API" 12)"
 LIVEKIT_API_SECRET="$(/usr/local/bin/store_secret.sh generate LIVEKIT_API_SECRET)"
 OPENVIDU_PRO_LICENSE="$(/usr/local/bin/store_secret.sh save OPENVIDU_PRO_LICENSE "${var.openviduLicense}")"
 OPENVIDU_RTC_ENGINE="$(/usr/local/bin/store_secret.sh save OPENVIDU_RTC_ENGINE "${var.rtcEngine}")"
 OPENVIDU_VERSION="$(/usr/local/bin/store_secret.sh save OPENVIDU_VERSION "$OPENVIDU_VERSION")"
 MASTER_NODE_PRIVATE_IP="$(/usr/local/bin/store_secret.sh save MASTER_NODE_PRIVATE_IP "$MASTER_NODE_PRIVATE_IP")"
+MASTER_NODE_ID="$(/usr/local/bin/store_secret.sh save MASTER_NODE_ID "$MASTER_NODE_ID")"
 
 ALL_SECRETS_GENERATED="$(/usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "true")"
 
-# Build install command
-INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_master_node.sh)"
+# Fetch the immutable 3.7.0 installer over TLS and verify the reviewed artifact
+# before running it as root. Update the checksum deliberately during upgrades.
+INSTALL_SCRIPT=/tmp/install_ov_master_node.sh
+INSTALL_SCRIPT_URL="https://s3-eu-west-1.amazonaws.com/get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_master_node.sh"
+INSTALL_SCRIPT_SHA256="fdaebc7a729110049dafbdd9de7bf8bcfe2a687c86f22c54d87c0601413cb9e8"
+curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT"
+printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$INSTALL_SCRIPT" | sha256sum --check --status || {
+  echo "OpenVidu master installer checksum verification failed"
+  exit 1
+}
+INSTALL_COMMAND="sh $INSTALL_SCRIPT"
 
 # Common arguments
 COMMON_ARGS=(
@@ -637,8 +779,9 @@ done
 EOF
 
   config_s3_script_master = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
+umask 077
 
 # Install dir and config dir
 INSTALL_DIR="/opt/openvidu"
@@ -666,6 +809,7 @@ EOF
   after_install_script_master = <<-EOF
 #!/bin/bash
 set -e
+umask 077
 
 # Generate URLs
 DOMAIN="$(grep '^DOMAIN_NAME=' /opt/openvidu/secrets.env | cut -d'=' -f2)"
@@ -689,6 +833,7 @@ EOF
   update_config_from_secret_script_master = <<-EOF
 #!/bin/bash
 set -e
+umask 077
 
 export AWS_ACCESS_KEY_ID="${digitalocean_spaces_key.openvidu_space_key.access_key}"
 export AWS_SECRET_ACCESS_KEY="${digitalocean_spaces_key.openvidu_space_key.secret_key}"
@@ -705,6 +850,7 @@ aws s3 cp \
   "$SECRETS_FILE" \
   --endpoint-url=https://${var.spaceRegion}.digitaloceanspaces.com \
   --region=${var.spaceRegion}
+chmod 600 "$SECRETS_FILE"
 
 
 # Define which keys belong to meet.env
@@ -743,6 +889,7 @@ EOF
   update_secret_from_config_script_master = <<-EOF
 #!/bin/bash
 set -e
+umask 077
 
 # Installation directory
 INSTALL_DIR="/opt/openvidu"
@@ -812,7 +959,7 @@ update_secret "ENABLED_MODULES" "$ENABLED_MODULES"
 EOF
 
   get_value_from_config_script_master = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
 
 # Function to get the value of a given key from the environment file
@@ -847,6 +994,7 @@ EOF
   store_secret_script_master = <<-EOF
 #!/bin/bash
 set -e
+umask 077
 
 export AWS_ACCESS_KEY_ID="${digitalocean_spaces_key.openvidu_space_key.access_key}"
 export AWS_SECRET_ACCESS_KEY="${digitalocean_spaces_key.openvidu_space_key.secret_key}"
@@ -899,7 +1047,7 @@ done
 EOF
 
   restart_script_master = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
 
 # Stop all services
@@ -915,7 +1063,7 @@ EOF
   autoscaler_function_code = <<-PYEOF
 import base64
 import json
-import os
+import math
 import random
 import time
 import traceback
@@ -923,7 +1071,7 @@ import urllib.request
 import urllib.error
 
 # ---- Configuration (values baked via Terraform interpolation) ----
-DO_TOKEN      = "${var.doToken}"
+DO_TOKEN      = "${var.autoscalerToken}"
 MEDIA_TAG     = "${digitalocean_tag.media_node_tag.name}"
 DRAINING_TAG  = "${digitalocean_tag.draining_tag.name}"
 REGION        = "${var.region}"
@@ -935,6 +1083,13 @@ MIN_NODES     = int("${var.minNumberOfMediaNodes}")
 MAX_NODES     = int("${var.maxNumberOfMediaNodes}")
 TARGET_CPU    = float("${var.scaleTargetCPU}")
 USER_DATA     = base64.b64decode("${base64encode(local.user_data_media)}").decode()
+
+EXPECTED_CPU_MODES = frozenset({
+    "idle", "iowait", "irq", "nice", "softirq", "steal", "system", "user",
+})
+# I/O wait is not CPU execution. Steal remains capacity pressure because the
+# Droplet wanted CPU time that the hypervisor could not provide.
+NON_EXECUTING_CPU_MODES = frozenset({"idle", "iowait"})
 
 API = "https://api.digitalocean.com/v2"
 HDR = {"Authorization": f"Bearer {DO_TOKEN}", "Content-Type": "application/json"}
@@ -955,7 +1110,12 @@ def apicall(method, path, body=None):
         req.data = json.dumps(body).encode()
     log(f"  -> {method} {path}")
     if body:
-        log(f"     body: {json.dumps(body)}")
+        # Media-node creation carries cloud-init containing runtime credentials.
+        # Keep useful request diagnostics without copying those credentials to logs.
+        logged_body = dict(body)
+        if "user_data" in logged_body:
+            logged_body["user_data"] = "[redacted]"
+        log(f"     body: {json.dumps(logged_body)}")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             d = r.read().decode()
@@ -964,6 +1124,8 @@ def apicall(method, path, body=None):
             return parsed
     except urllib.error.HTTPError as e:
         body_txt = e.read().decode()[:400]
+        if isinstance(body, dict) and "user_data" in body:
+            body_txt = "[response redacted for media-node creation]"
         log(f"     <- HTTP {e.code} ERROR: {body_txt}")
         return None
     except urllib.error.URLError as e:
@@ -977,128 +1139,80 @@ def apicall(method, path, body=None):
 def list_nodes():
     log("Listing media nodes ...")
     r = apicall("GET", f"/droplets?tag_name={MEDIA_TAG}&per_page=200")
-    nodes = r.get("droplets", []) if r else []
+    if r is None:
+        raise RuntimeError("DigitalOcean did not return the media-node inventory")
+    nodes = r.get("droplets")
+    if not isinstance(nodes, list):
+        raise RuntimeError("DigitalOcean returned an invalid media-node inventory")
     for d in nodes:
+        tags = d.get("tags") if isinstance(d, dict) else None
+        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+            raise RuntimeError("DigitalOcean returned invalid media-node tag metadata")
         log(f"  droplet id={d['id']} name={d['name']} status={d['status']} "
             f"region={d.get('region',{}).get('slug','?')} created={d.get('created_at','?')}")
     return nodes
+
+def counter_delta(values, mode, did):
+    if not isinstance(values, list) or len(values) < 2:
+        log(f"    Missing {mode} CPU samples for {did}")
+        return None
+    try:
+        first = float(values[0][1])
+        last = float(values[-1][1])
+    except (IndexError, TypeError, ValueError):
+        log(f"    Invalid {mode} CPU samples for {did}")
+        return None
+    if not math.isfinite(first) or not math.isfinite(last):
+        log(f"    Non-finite {mode} CPU samples for {did}")
+        return None
+    delta = last - first
+    if delta < 0:
+        # DigitalOcean counters can reset after a reboot. A negative interval is
+        # not low utilization and must never be used to choose a node to delete.
+        log(f"    {mode} CPU counter reset for {did}")
+        return None
+    return delta
 
 def cpu(did, name):
     now = int(time.time())
     log(f"  Fetching CPU metrics for droplet {did} ({name}) ...")
     r = apicall("GET", f"/monitoring/metrics/droplet/cpu?host_id={did}&start={now - 240}&end={now}")
-    if not r or "data" not in r:
+    if r is None:
+        log(f"    CPU metrics request failed for {did}")
+        return None
+    results = r.get("data", {}).get("result")
+    if not isinstance(results, list):
         log(f"    No metrics data for {did}")
         return None
-    idle = next(
-      (
-        float(item["values"][-1][1])
-        for item in (
-          r.get("data", {}).get("result", [])
-          if isinstance(r.get("data", {}).get("result", []), list)
-          else [r]
-        )
-        if item.get("metric", {}).get("mode") == "idle" and item.get("values")
-      ),
-      None,
-    )
-    if not idle:
-        log(f"    No idle samples found for {did}")
+
+    mode_deltas = {}
+    for item in results:
+        mode = item.get("metric", {}).get("mode")
+        if not isinstance(mode, str) or not mode:
+            log(f"    CPU metric without a mode for {did}")
+            return None
+        delta = counter_delta(item.get("values"), mode, did)
+        if delta is None:
+            return None
+        mode_deltas[mode] = mode_deltas.get(mode, 0.0) + delta
+
+    returned_modes = frozenset(mode_deltas)
+    if returned_modes != EXPECTED_CPU_MODES:
+        missing = sorted(EXPECTED_CPU_MODES - returned_modes)
+        unexpected = sorted(returned_modes - EXPECTED_CPU_MODES)
+        log(f"    Unexpected CPU mode set for {did}: missing={missing} unexpected={unexpected}")
         return None
-    system = next(
-      (
-        float(item["values"][-1][1])
-        for item in (
-          r.get("data", {}).get("result", [])
-          if isinstance(r.get("data", {}).get("result", []), list)
-          else [r]
-        )
-        if item.get("metric", {}).get("mode") == "system" and item.get("values")
-      ),
-      None,
-    )
-    if not system:
-        log(f"    No system CPU samples found for {did}")
+
+    total_delta = sum(mode_deltas.values())
+    if total_delta <= 0:
+        log(f"    CPU counters did not advance for {did}")
         return None
-    user = next(
-      (
-        float(item["values"][-1][1])
-        for item in (
-          r.get("data", {}).get("result", [])
-          if isinstance(r.get("data", {}).get("result", []), list)
-          else [r]
-        )
-        if item.get("metric", {}).get("mode") == "user" and item.get("values")
-      ),
-      None,
-    )
-    if not user:
-        log(f"    No user CPU samples found for {did}")
-        return None
-    last_idle = next(
-      (
-      float(item["values"][0][1])  # first sample instead of last
-      for item in (
-        r.get("data", {}).get("result", [])
-        if isinstance(r.get("data", {}).get("result", []), list)
-        else [r]
-      )
-      if item.get("metric", {}).get("mode") == "idle" and item.get("values")
-      ),
-      None,
-    )
-    if last_idle is None:
-      log(f"    No initial idle sample found for {did}")
-      return None
-    last_system = next(
-      (
-      float(item["values"][0][1])  # first sample instead of last
-      for item in (
-        r.get("data", {}).get("result", [])
-        if isinstance(r.get("data", {}).get("result", []), list)
-        else [r]
-      )
-      if item.get("metric", {}).get("mode") == "system" and item.get("values")
-      ),
-      None,
-    )
-    if last_system is None:
-      log(f"    No initial system CPU sample found for {did}")
-      return None
-    last_user= next(
-      (
-      float(item["values"][0][1])  # first sample instead of last
-      for item in (
-        r.get("data", {}).get("result", [])
-        if isinstance(r.get("data", {}).get("result", []), list)
-        else [r]
-      )
-      if item.get("metric", {}).get("mode") == "user" and item.get("values")
-      ),
-      None,
-    )
-    if last_user is None:
-      log(f"    No initial user CPU sample found for {did}")
-      return None
 
-    log(f"    Response data: {json.dumps(r)}")
-    log(f"    Idle now: {idle}, 4 minutes ago: {last_idle}")
-    log(f"    System now: {system}, 4 minutes ago: {last_system}")
-    log(f"    User now: {user}, 4 minutes ago: {last_user}")
-    idle_last_4_minutes = idle - last_idle
-    system_last_4_minutes = system - last_system
-    user_last_4_minutes = user - last_user
-
-    log(f"    Idle CPU in last 4 minutes: {idle_last_4_minutes}")
-    log(f"    System CPU in last 4 minutes: {system_last_4_minutes}")
-    log(f"    User CPU in last 4 minutes: {user_last_4_minutes}")
-
-    total_last_4_minutes = system_last_4_minutes + user_last_4_minutes
-
-    usage = (total_last_4_minutes / (total_last_4_minutes + idle_last_4_minutes)) * 100 if (total_last_4_minutes + idle_last_4_minutes) > 0 else 0.0
+    non_executing_delta = sum(mode_deltas[mode] for mode in NON_EXECUTING_CPU_MODES)
+    active_delta = total_delta - non_executing_delta
+    usage = (active_delta / total_delta) * 100
+    log(f"    CPU deltas for {did}: {json.dumps(mode_deltas, sort_keys=True)}")
     log(f"    CPU usage for {did} ({name}): {usage}%")
-    if last_idle == idle:
-        return None
     return usage
 
 def create_node():
@@ -1124,47 +1238,67 @@ def create_node():
 
 def tag_res(did, t):
     log(f"  Tagging droplet {did} with '{t}' ...")
-    apicall("POST", f"/tags/{t}/resources",
-        {"resources": [{"resource_id": str(did), "resource_type": "droplet"}]})
+    return apicall(
+        "POST",
+        f"/tags/{t}/resources",
+        {"resources": [{"resource_id": str(did), "resource_type": "droplet"}]},
+    ) is not None
 
 def untag_res(did, t):
     log(f"  Removing tag '{t}' from droplet {did} ...")
-    url = f"{API}/tags/{t}/resources"
-    req = urllib.request.Request(url, headers=HDR, method="DELETE")
-    req.data = json.dumps({"resources": [{"resource_id": str(did), "resource_type": "droplet"}]}).encode()
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            log(f"    <- {r.status} OK")
-    except urllib.error.HTTPError as e:
-        log(f"    <- HTTP {e.code} ERROR: {e.read().decode()[:200]}")
-    except Exception as e:
-        log(f"    <- error: {e}")
+    return apicall(
+        "DELETE",
+        f"/tags/{t}/resources",
+        {"resources": [{"resource_id": str(did), "resource_type": "droplet"}]},
+    ) is not None
+
+def finish(result):
+    log("=" * 60)
+    result["logs"] = list(_LOGS)
+    return {"body": result}
 
 def main(args):
-    """DO Functions entry point — invoked every 5 minutes by scheduled trigger."""
+    """DO Functions entry point — invoked every 4 minutes by scheduled trigger."""
+    # Function containers are reused. Keep each activation response bounded to
+    # this invocation instead of accumulating diagnostics from earlier runs.
+    _LOGS.clear()
     log("=" * 60)
     log(f"Autoscaler invoked | stack={STACK_NAME} region={REGION}")
     log(f"Config: min={MIN_NODES} max={MAX_NODES} target_cpu={TARGET_CPU}%")
     log(f"Tags: media='{MEDIA_TAG}' draining='{DRAINING_TAG}'")
     log("=" * 60)
 
-    result = {"action": "none", "nodes": 0, "avg_cpu": 0.0}
+    result = {
+        "action": "hold",
+        "nodes": None,
+        "draining_nodes": None,
+        "avg_cpu": None,
+    }
 
     try:
-        nodes = list_nodes()
+        tagged_nodes = list_nodes()
+        # A failed active-tag removal can leave a node with both lifecycle tags while its
+        # on-node watcher is already draining it. It is no longer usable capacity and must
+        # never mask the configured floor or become a scale-in candidate on the next run.
+        draining_nodes = [d for d in tagged_nodes if DRAINING_TAG in d["tags"]]
+        nodes = [d for d in tagged_nodes if DRAINING_TAG not in d["tags"]]
         n = len(nodes)
         result["nodes"] = n
-        log(f"Total media nodes: {n}")
+        result["draining_nodes"] = len(draining_nodes)
+        log(
+            f"Usable media nodes: {n}; "
+            f"draining nodes still carrying active tag: {len(draining_nodes)}"
+        )
 
         # Ensure minimum
         if n < MIN_NODES:
             log(f"DECISION: scale-out-min (have {n}, need {MIN_NODES})")
             created = create_node()
-            result["action"] = "scale-out-min"
+            result["action"] = "scale-out-min" if created else "hold"
             result["created"] = created
-            log("=" * 60)
-            result["logs"] = _LOGS
-            return {"body": result}
+            if not created:
+                result["error"] = "DigitalOcean did not confirm media-node creation"
+            return finish(result)
 
         # Gather CPU for all nodes
         log("Gathering CPU metrics ...")
@@ -1174,16 +1308,19 @@ def main(args):
             if usage is not None:
                 cmap[d["id"]] = (usage, d["name"])
             else:
-                log(f"  Skipping {d['id']} ({d['name']}) — no CPU data")
+                log(f"  Missing CPU data for {d['id']} ({d['name']})")
 
-        if cmap:
-            avg = sum(v for v, _ in cmap.values()) / len(cmap)
-        else:
-            avg = 0.0
-            log("WARNING: no CPU data available for any node — skipping scaling decisions")
-
-        result["avg_cpu"] = round(avg, 2)
         result["nodes_with_metrics"] = len(cmap)
+        if len(cmap) != n:
+            # Missing metrics commonly means a node is still booting or the
+            # monitoring API is degraded. Neither state is evidence to add or
+            # remove capacity, so wait for a complete sample on the next run.
+            result["error"] = f"CPU metrics available for only {len(cmap)}/{n} media nodes"
+            log(f"DECISION: hold ({result['error']})")
+            return finish(result)
+
+        avg = sum(v for v, _ in cmap.values()) / len(cmap)
+        result["avg_cpu"] = round(avg, 2)
         log(f"Average CPU across {len(cmap)}/{n} nodes: {avg:.2f}%")
         for did, (usage, name) in sorted(cmap.items(), key=lambda x: x[1][0], reverse=True):
             log(f"  {did} ({name}): {usage}%")
@@ -1192,39 +1329,50 @@ def main(args):
         if avg > TARGET_CPU and n < MAX_NODES:
             log(f"DECISION: scale-out (avg={avg:.2f}% > target={TARGET_CPU}%, nodes={n} < max={MAX_NODES})")
             created = create_node()
-            result["action"] = "scale-out"
+            result["action"] = "scale-out" if created else "hold"
             result["created"] = created
-            log("=" * 60)
-            result["logs"] = _LOGS
-            return {"body": result}
+            if not created:
+                result["error"] = "DigitalOcean did not confirm media-node creation"
+            return finish(result)
 
         if avg > TARGET_CPU and n >= MAX_NODES:
             log(f"DECISION: hold (avg={avg:.2f}% > target but already at max={MAX_NODES})")
 
         # Scale in
-        thr = TARGET_CPU
+        # Keep a dead band between scale-out and scale-in so a cluster near the
+        # target does not repeatedly add and drain nodes on consecutive runs.
+        thr = TARGET_CPU * 0.7
         log(f"Scale-in threshold: {thr:.2f}%")
         do_in = (avg < thr and n > MIN_NODES) or (n > MAX_NODES)
 
-        if do_in:
+        if do_in and draining_nodes:
+            draining_ids = sorted(str(node["id"]) for node in draining_nodes)
+            result["warning"] = (
+                "Scale-in deferred while nodes remain both active-tagged and draining: "
+                + ", ".join(draining_ids)
+            )
+            log(f"DECISION: hold ({result['warning']})")
+        elif do_in:
             log(f"DECISION: scale-in (avg={avg:.2f}% < thr={thr:.2f}% or n={n} > max={MAX_NODES})")
             # Pick the node with lowest CPU usage
-            if cmap:
-                tid = min(cmap, key=lambda x: cmap[x][0])
-                tname = cmap[tid][1]
-                tcpu  = cmap[tid][0]
+            tid = min(cmap, key=lambda x: cmap[x][0])
+            tname = cmap[tid][1]
+            tcpu = cmap[tid][0]
+            log(f"  Selected node to drain: {tid} ({tname}) CPU={tcpu}%")
+            # Add the draining tag first. Its firewall coverage and on-node
+            # watcher are the safety net even if removing the active tag fails.
+            if not tag_res(tid, DRAINING_TAG):
+                result["error"] = f"Could not mark media node {tid} as draining"
+                log(f"DECISION: hold ({result['error']})")
             else:
-                tid   = nodes[0]["id"]   if nodes else None
-                tname = nodes[0]["name"] if nodes else "?"
-                tcpu  = 0.0
-            if tid:
-                log(f"  Selected node to drain: {tid} ({tname}) CPU={tcpu}%")
-                untag_res(tid, MEDIA_TAG)
-                tag_res(tid, DRAINING_TAG)
                 result["action"] = "scale-in"
                 result["drained_node"] = {"id": tid, "name": tname, "cpu": tcpu}
-            else:
-                log("  No node available to drain")
+                if not untag_res(tid, MEDIA_TAG):
+                    result["warning"] = (
+                        f"Media node {tid} is draining but still has its active tag; "
+                        "the node watcher will retry self-deletion"
+                    )
+                    log(f"WARNING: {result['warning']}")
         else:
             log(f"DECISION: hold (avg={avg:.2f}% within range, nodes={n} within min/max)")
 
@@ -1233,32 +1381,33 @@ def main(args):
         log(traceback.format_exc())
         result["error"] = str(e)
 
-    log("=" * 60)
-    result["logs"] = _LOGS
-    return {"body": result}
+    return finish(result)
 PYEOF
 
   tag_watcher_script_media = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 DRAINING_TAG="${digitalocean_tag.draining_tag.name}"
 SELF_TAGS=$(curl -sf http://169.254.169.254/metadata/v1/tags 2>/dev/null || echo "")
 
 if echo "$SELF_TAGS" | grep -qw "$DRAINING_TAG"; then
   echo "$(date): Draining tag detected. Initiating graceful shutdown."
-  rm -f /etc/cron.d/tag-watcher
-  nohup /usr/local/bin/graceful_shutdown.sh > /var/log/graceful_shutdown.log 2>&1 &
+  # Keep the cron entry until deletion succeeds. flock prevents concurrent
+  # drains while allowing a later cron run to retry a failed self-delete.
+  nohup flock -n /var/lock/openvidu-media-drain.lock \
+    /usr/local/bin/graceful_shutdown.sh >> /var/log/graceful_shutdown.log 2>&1 &
 fi
 EOF
 
   user_data_master = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -eu -o pipefail
+umask 077
 
 # restart.sh
 cat > /usr/local/bin/restart.sh << 'RESTART_EOF'
 ${local.restart_script_master}
 RESTART_EOF
-chmod +x /usr/local/bin/restart.sh
+  chmod 700 /usr/local/bin/restart.sh
 
 # Check if installation already completed
 if [ -f /usr/local/bin/openvidu_install_counter.txt ]; then
@@ -1269,97 +1418,116 @@ else
   cat > /usr/local/bin/install.sh << 'INSTALL_EOF'
 ${local.install_script_master}
 INSTALL_EOF
-  chmod +x /usr/local/bin/install.sh
+  chmod 700 /usr/local/bin/install.sh
 
   # after_install.sh
   cat > /usr/local/bin/after_install.sh << 'AFTER_INSTALL_EOF'
 ${local.after_install_script_master}
 AFTER_INSTALL_EOF
-  chmod +x /usr/local/bin/after_install.sh
+  chmod 700 /usr/local/bin/after_install.sh
 
   # update_config_from_secret.sh
   cat > /usr/local/bin/update_config_from_secret.sh << 'UPDATE_CONFIG_EOF'
 ${local.update_config_from_secret_script_master}
 UPDATE_CONFIG_EOF
-  chmod +x /usr/local/bin/update_config_from_secret.sh
+  chmod 700 /usr/local/bin/update_config_from_secret.sh
 
   # update_secret_from_config.sh
   cat > /usr/local/bin/update_secret_from_config.sh << 'UPDATE_SECRET_EOF'
 ${local.update_secret_from_config_script_master}
 UPDATE_SECRET_EOF
-  chmod +x /usr/local/bin/update_secret_from_config.sh
+  chmod 700 /usr/local/bin/update_secret_from_config.sh
 
   # get_value_from_config.sh
   cat > /usr/local/bin/get_value_from_config.sh << 'GET_VALUE_EOF'
 ${local.get_value_from_config_script_master}
 GET_VALUE_EOF
-  chmod +x /usr/local/bin/get_value_from_config.sh
+  chmod 700 /usr/local/bin/get_value_from_config.sh
 
   # store_secret.sh
   cat > /usr/local/bin/store_secret.sh << 'STORE_SECRET_EOF'
 ${local.store_secret_script_master}
 STORE_SECRET_EOF
-  chmod +x /usr/local/bin/store_secret.sh
+  chmod 700 /usr/local/bin/store_secret.sh
 
   # check_app_ready.sh
   cat > /usr/local/bin/check_app_ready.sh << 'CHECK_APP_EOF'
 ${local.check_app_ready_script_master}
 CHECK_APP_EOF
-  chmod +x /usr/local/bin/check_app_ready.sh
+  chmod 700 /usr/local/bin/check_app_ready.sh
 
   # config_s3.sh
   cat > /usr/local/bin/config_s3.sh << 'CONFIG_S3_EOF'
 ${local.config_s3_script_master}
 CONFIG_S3_EOF
-  chmod +x /usr/local/bin/config_s3.sh
+  chmod 700 /usr/local/bin/config_s3.sh
 
   echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
   apt-get update && apt-get install -y \
   curl \
   unzip \
   jq \
-  wget \
   ca-certificates \
   gnupg \
   lsb-release \
   openssl
 
   AWS_CLI_VERSION=2.35.5
+  AWS_CLI_SHA256=54b7006cbaf125eca01f72f93010b15c2f819c82e8bc8ea6834ce853f87dc9e7
+  [ "$(uname -m)" = "x86_64" ] || { echo "Unsupported AWS CLI architecture"; exit 1; }
   # Install aws-cli
-  curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m)-$${AWS_CLI_VERSION}.zip" -o "awscliv2.zip"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-$${AWS_CLI_VERSION}.zip" -o "awscliv2.zip"
+  printf '%s  %s\n' "$AWS_CLI_SHA256" awscliv2.zip | sha256sum --check --status || {
+    echo "AWS CLI checksum verification failed"
+    exit 1
+  }
   unzip -qq awscliv2.zip
   ./aws/install
   rm -rf awscliv2.zip aws
 
   DOCTL_VERSION=1.162.0
+  DOCTL_SHA256=338ad0796fb7a7e20f2e833d88d6daa40d5d6372b39ca54d327e212ff20bc236
   # Install doctl
   cd ~
-  wget https://github.com/digitalocean/doctl/releases/download/v$${DOCTL_VERSION}/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
+  curl -fsSL \
+    https://github.com/digitalocean/doctl/releases/download/v$${DOCTL_VERSION}/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz \
+    -o doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
+  printf '%s  %s\n' "$DOCTL_SHA256" doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz \
+    | sha256sum --check --status || {
+      echo "doctl checksum verification failed"
+      exit 1
+    }
   tar xf ~/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
   mv ~/doctl /usr/local/bin
   rm -f ~/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
 
   export HOME="/root"
 
-  doctl auth init -t "${var.doToken}"
+  # Terraform attaches the reserved IP and updates Route53 after the Droplet starts.
+  # Wait before requesting a Let's Encrypt certificate instead of racing those resources.
+  if [ "${var.certificateType}" = "letsencrypt" ] && [ -n "${var.domainName}" ]; then
+    DNS_READY=false
+    for ATTEMPT in $(seq 1 120); do
+      PUBLIC_IP=$(curl -fsS http://169.254.169.254/metadata/v1/floating_ip/ipv4/ip_address || true)
+      RESOLVED_IP=$(getent ahostsv4 "${var.domainName}" 2>/dev/null \
+        | awk 'NR == 1 { print $1 }' || true)
+      if [ -n "$PUBLIC_IP" ] && [ "$RESOLVED_IP" = "$PUBLIC_IP" ]; then
+        DNS_READY=true
+        break
+      fi
+      echo "Waiting for ${var.domainName} to resolve to the attached reserved IP ($ATTEMPT/120)"
+      sleep 5
+    done
+    if [ "$DNS_READY" != "true" ]; then
+      echo "Route53 did not converge before the OpenVidu certificate installation deadline"
+      exit 1
+    fi
+  fi
 
   export AWS_ACCESS_KEY_ID="${digitalocean_spaces_key.openvidu_space_key.access_key}"
   export AWS_SECRET_ACCESS_KEY="${digitalocean_spaces_key.openvidu_space_key.secret_key}"
   export AWS_DEFAULT_REGION="${var.spaceRegion}"
   
-  # Save private key to bucket (for manual SSH access)
-  echo "${tls_private_key.openvidu_ssh_key.private_key_openssh}" > /tmp/openvidu_ssh_key_elastic.pem
-  chmod 600 /tmp/openvidu_ssh_key_elastic.pem
-
-  # Upload private key to the bucket
-  aws s3 cp /tmp/openvidu_ssh_key_elastic.pem \
-  s3://${var.spaceName == "" ? digitalocean_spaces_bucket.openvidu_space[0].name : var.spaceName}/openvidu_ssh_key_elastic.pem \
-  --endpoint-url=https://${var.spaceRegion}.digitaloceanspaces.com \
-  --acl private \
-  --region=${var.spaceRegion}
-
-  rm -f /tmp/openvidu_ssh_key_elastic.pem
-
   # Install OpenVidu
   /usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu"; exit 1; }
   
@@ -1386,8 +1554,9 @@ EOF
   # ----- media -----
 
   install_script_media = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
+umask 077
 
 # Install dependencies
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
@@ -1398,34 +1567,50 @@ apt-get update && apt-get install -y
 export AWS_ACCESS_KEY_ID="${digitalocean_spaces_key.openvidu_space_key.access_key}"
 export AWS_SECRET_ACCESS_KEY="${digitalocean_spaces_key.openvidu_space_key.secret_key}"
 export AWS_DEFAULT_REGION="${var.spaceRegion}"
+EXPECTED_MASTER_NODE_PRIVATE_IP="${digitalocean_droplet.openvidu_master_node.ipv4_address_private}"
+EXPECTED_MASTER_NODE_ID="${digitalocean_droplet.openvidu_master_node.id}"
 mkdir -p /opt/openvidu
 
-# Active wait for secrets.env to be available
+# A master replacement leaves the previous secrets.env in Spaces until the new
+# master finishes bootstrapping. Private addresses can be reused, so the
+# immutable Droplet ID is the generation guard while the IP remains a topology
+# check. Wait for both rather than accepting any existing object.
 MAX_RETRIES=200
 RETRY_COUNT=0
+SECRETS_READY=false
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
   if aws s3 cp \
     s3://${var.spaceName == "" ? digitalocean_spaces_bucket.openvidu_space[0].name : var.spaceName}/secrets.env \
     /opt/openvidu/secrets.env \
     --endpoint-url=https://${var.spaceRegion}.digitaloceanspaces.com \
     --region=${var.spaceRegion}; then
-    echo "Successfully retrieved secrets.env"
-    break
-  else
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    echo "Waiting for secrets.env... Attempt $RETRY_COUNT/$MAX_RETRIES"
-    sleep 10
+    chmod 600 /opt/openvidu/secrets.env
+    DOWNLOADED_MASTER_NODE_PRIVATE_IP=$(sed -n \
+      's/^MASTER_NODE_PRIVATE_IP=//p' /opt/openvidu/secrets.env | tail -1)
+    DOWNLOADED_MASTER_NODE_ID=$(sed -n \
+      's/^MASTER_NODE_ID=//p' /opt/openvidu/secrets.env | tail -1)
+    if [ "$DOWNLOADED_MASTER_NODE_ID" = "$EXPECTED_MASTER_NODE_ID" ] \
+      && [ "$DOWNLOADED_MASTER_NODE_PRIVATE_IP" = "$EXPECTED_MASTER_NODE_PRIVATE_IP" ]; then
+      echo "Retrieved secrets.env for the current master"
+      SECRETS_READY=true
+      break
+    fi
+    echo "Retrieved stale secrets.env; waiting for the replacement master"
   fi
+
+  RETRY_COUNT=$((RETRY_COUNT + 1))
+  echo "Waiting for current secrets.env... Attempt $RETRY_COUNT/$MAX_RETRIES"
+  sleep 10
 done
 
-if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-  echo "Failed to retrieve secrets.env after $MAX_RETRIES attempts"
+if [ "$SECRETS_READY" != "true" ]; then
+  echo "Failed to retrieve secrets.env for the current master after $MAX_RETRIES attempts"
   exit 1
 fi
 
 # Get IPs using DO metadata
 PRIVATE_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/private/0/ipv4/address)
-MASTER_NODE_PRIVATE_IP=$(grep '^MASTER_NODE_PRIVATE_IP=' /opt/openvidu/secrets.env | cut -d'=' -f2)
+MASTER_NODE_PRIVATE_IP="$EXPECTED_MASTER_NODE_PRIVATE_IP"
 
 # Get all necessary values from secrets
 DOMAIN=$(grep '^DOMAIN_NAME=' /opt/openvidu/secrets.env | cut -d'=' -f2)
@@ -1433,8 +1618,17 @@ REDIS_PASSWORD=$(grep '^REDIS_PASSWORD=' /opt/openvidu/secrets.env | cut -d'=' -
 OPENVIDU_VERSION=$(grep '^OPENVIDU_VERSION=' /opt/openvidu/secrets.env | cut -d'=' -f2)
 OPENVIDU_PRO_LICENSE=$(grep '^OPENVIDU_PRO_LICENSE=' /opt/openvidu/secrets.env | cut -d'=' -f2)
 
-# Build install command for media node
-INSTALL_COMMAND="sh <(curl -fsSL http://get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_media_node.sh)"
+# Match the master bootstrap's transport and integrity guarantees. A changed
+# upstream artifact must be reviewed and repinned rather than executed silently.
+INSTALL_SCRIPT=/tmp/install_ov_media_node.sh
+INSTALL_SCRIPT_URL="https://s3-eu-west-1.amazonaws.com/get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_media_node.sh"
+INSTALL_SCRIPT_SHA256="69c15c9ab72de6cb9c49dfecb547be952deacd35dfcd22cc4e26c162693da28b"
+curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT"
+printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$INSTALL_SCRIPT" | sha256sum --check --status || {
+  echo "OpenVidu media installer checksum verification failed"
+  exit 1
+}
+INSTALL_COMMAND="sh $INSTALL_SCRIPT"
 
 # Media node arguments
 COMMON_ARGS=(
@@ -1468,7 +1662,7 @@ done
 EOF
 
   graceful_shutdown_script_media = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -e
 
 echo "Starting graceful shutdown of OpenVidu Media Node..."
@@ -1484,11 +1678,17 @@ if [ -x "$(command -v docker)" ]; then
     docker container kill --signal=SIGQUIT "$agent_container"
   done
 
-  # Wait for running containers to not be openvidu, ingress, egress or an openvidu agent
+  # Bound one watcher attempt without treating elapsed time as permission to
+  # delete a node that still owns live media. The cron watcher retries later.
+  DRAIN_DEADLINE=$(( $(date +%s) + 600 ))
   while [ $(docker ps --filter "label=openvidu-agent=true" -q | wc -l) -gt 0 ] || \
         [ $(docker inspect -f '{{.State.Running}}' openvidu 2>/dev/null) == "true" ] || \
         [ $(docker inspect -f '{{.State.Running}}' ingress 2>/dev/null) == "true" ] || \
         [ $(docker inspect -f '{{.State.Running}}' egress 2>/dev/null) == "true" ]; do
+    if [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ]; then
+      echo "Media is still active after 10 minutes; leaving the node draining for a later retry"
+      exit 1
+    fi
     echo "Waiting for containers to stop..."
     sleep 10
   done
@@ -1497,66 +1697,79 @@ fi
 # Self-delete using doctl
 
 # Get droplet ID from metadata
-DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
+DROPLET_ID=$(curl -fsS http://169.254.169.254/metadata/v1/id)
 
 # Delete this instance using doctl
-doctl compute droplet delete "$DROPLET_ID" \
-  --force || echo "Failed to self-delete, instance may already be terminating"
+doctl compute droplet delete "$DROPLET_ID" --force
 
 echo "Graceful shutdown completed."
 EOF
 
   user_data_media = <<-EOF
-#!/bin/bash -x
+#!/bin/bash
 set -eu -o pipefail
+umask 077
 
 # install.sh (media node)
 cat > /usr/local/bin/install.sh << 'INSTALL_MEDIA_EOF'
 ${local.install_script_media}
 INSTALL_MEDIA_EOF
-chmod +x /usr/local/bin/install.sh
+chmod 700 /usr/local/bin/install.sh
 
 # graceful_shutdown.sh
 cat > /usr/local/bin/graceful_shutdown.sh << 'GRACEFUL_SHUTDOWN_EOF'
 ${local.graceful_shutdown_script_media}
 GRACEFUL_SHUTDOWN_EOF
-chmod +x /usr/local/bin/graceful_shutdown.sh
+chmod 700 /usr/local/bin/graceful_shutdown.sh
 
 # tag_watcher.sh (detects draining tag and triggers graceful shutdown)
 cat > /usr/local/bin/tag_watcher.sh << 'TAG_WATCHER_EOF'
 ${local.tag_watcher_script_media}
 TAG_WATCHER_EOF
-chmod +x /usr/local/bin/tag_watcher.sh
+chmod 700 /usr/local/bin/tag_watcher.sh
 
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 apt-get update && apt-get install -y \
   curl \
   unzip \
   jq \
-  wget \
   ca-certificates \
   gnupg \
   lsb-release \
   openssl
 
 AWS_CLI_VERSION=2.35.5
+AWS_CLI_SHA256=54b7006cbaf125eca01f72f93010b15c2f819c82e8bc8ea6834ce853f87dc9e7
+[ "$(uname -m)" = "x86_64" ] || { echo "Unsupported AWS CLI architecture"; exit 1; }
 # Install aws-cli
-curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m)-$${AWS_CLI_VERSION}.zip" -o "awscliv2.zip"
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-$${AWS_CLI_VERSION}.zip" -o "awscliv2.zip"
+printf '%s  %s\n' "$AWS_CLI_SHA256" awscliv2.zip | sha256sum --check --status || {
+  echo "AWS CLI checksum verification failed"
+  exit 1
+}
 unzip -qq awscliv2.zip
 ./aws/install
 rm -rf awscliv2.zip aws
 
 DOCTL_VERSION=1.162.0
+DOCTL_SHA256=338ad0796fb7a7e20f2e833d88d6daa40d5d6372b39ca54d327e212ff20bc236
 # Install doctl
 cd ~
-wget https://github.com/digitalocean/doctl/releases/download/v$${DOCTL_VERSION}/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
+curl -fsSL \
+  https://github.com/digitalocean/doctl/releases/download/v$${DOCTL_VERSION}/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz \
+  -o doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
+printf '%s  %s\n' "$DOCTL_SHA256" doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz \
+  | sha256sum --check --status || {
+    echo "doctl checksum verification failed"
+    exit 1
+  }
 tar xf ~/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
 mv ~/doctl /usr/local/bin
 rm -f ~/doctl-$${DOCTL_VERSION}-linux-amd64.tar.gz
 
 export HOME="/root"
 
-doctl auth init -t "${var.doToken}"
+doctl auth init -t "${var.autoscalerToken}"
 
 # Install OpenVidu Media Node
 /usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu Media Node"; exit 1; }
@@ -1567,7 +1780,7 @@ echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
 # Start OpenVidu
 systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1; }
 
-# Tag watcher cron: check every minute if this node should be drained
+# Tag watcher cron: check every two minutes if this node should be drained
 if [ "${var.fixedNumberOfMediaNodes}" -eq 0 ]; then
 echo "*/2 * * * * root /usr/local/bin/tag_watcher.sh >> /var/log/tag_watcher.log 2>&1" > /etc/cron.d/tag-watcher
 chmod 644 /etc/cron.d/tag-watcher

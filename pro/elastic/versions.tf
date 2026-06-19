@@ -1,6 +1,13 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.10.0"
+
+  backend "s3" {}
+
   required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
     digitalocean = {
       source  = "digitalocean/digitalocean"
       version = ">= 2.30.0"
@@ -24,4 +31,8 @@ provider "digitalocean" {
   token             = var.doToken
   spaces_access_id  = var.spacesAccessId
   spaces_secret_key = var.spacesSecretKey
+}
+
+provider "aws" {
+  region = var.awsRegion
 }

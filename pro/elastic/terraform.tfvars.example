@@ -3,16 +3,15 @@
 #  You must fill in these variables for the deployment to work.
 # =================================================================
 
-# Your DigitalOcean API Token.
-# You can generate it at: https://cloud.digitalocean.com/account/api
-doToken = "put_your_digitalocean_token_here"
-
-# Your OpenVidu license PRO.
-# Get it here: https://openvidu.io/account
-openviduLicense = "put_your_openvidu_license_here"
+# CourseUltra supplies doToken and the Spaces bootstrap credentials from macOS
+# Keychain, and supplies autoscalerToken and openviduLicense from AWS SSM through
+# courseultra-terraform.sh. Never put those values in this file.
 
 # Name to identify your deployment (e.g., "openvidu-elastic").
 stackName = "openvidu-elastic"
+
+# CIDR ranges allowed to SSH to the cluster. Use the current operator IP as /32.
+sshAllowedCidrs = ["203.0.113.10/32"]
 
 # =================================================================
 #  OPTIONAL CONFIGURATION
@@ -26,6 +25,9 @@ stackName = "openvidu-elastic"
 # Leave commented to use the default
 # region = "ams3"
 
+# Private VPC CIDR. It must not overlap another VPC in the DigitalOcean account.
+# vpcIpRange = "10.10.10.0/24"
+
 # Master Node server size (Droplet). Default: s-4vcpu-8gb.
 # Leave commented to use the default
 # masterNodeInstanceType = "s-4vcpu-8gb"
@@ -33,9 +35,6 @@ stackName = "openvidu-elastic"
 # Media Node server size (Droplet). Default: s-4vcpu-8gb.
 # Leave commented to use the default
 # mediaNodeInstanceType = "s-4vcpu-8gb"
-
-# Number of media nodes to create on initial deploy. Default: 1.
-# initialNumberOfMediaNodes = 1
 
 # Minimum number of media nodes (autoscaler never goes below). Default: 1.
 # minNumberOfMediaNodes = 1
@@ -54,6 +53,9 @@ stackName = "openvidu-elastic"
 # Leave commented to use the default
 # rtcEngine = "pion"
 
+# OpenVidu modules enabled on the master node.
+# enabledModules = "observability,openviduMeet"
+
 
 # --- Domain and SSL Certificates ---
 
@@ -69,6 +71,9 @@ stackName = "openvidu-elastic"
 # Required if using 'owncert'. Recommended for 'letsencrypt'.
 # Leave empty or commented if you want to use an automatic sslip.io domain.
 # domainName = "video.mycompany.com"
+
+# Route53 hosted zone containing domainName. Required when domainName is set.
+# route53ZoneId = "Z0123456789EXAMPLE"
 
 # Only if using 'owncert': Content of the public certificate and private key in base64 format.
 # ownPublicCertificate  = "base64_of_your_public_certificate.pem"
@@ -105,4 +110,3 @@ stackName = "openvidu-elastic"
 
 # Extra flags for the installer.
 # additionalInstallFlags = "--flag1=value"
-

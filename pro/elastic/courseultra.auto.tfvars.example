@@ -1,0 +1,25 @@
+stackName = "courseultra-openvidu"
+
+region      = "sgp1"
+spaceRegion = "sgp1"
+spaceName   = "courseultra-openvidu-space-634856ccf8"
+vpcIpRange  = "10.10.20.0/24"
+
+masterNodeInstanceType = "s-4vcpu-8gb"
+mediaNodeInstanceType  = "s-4vcpu-8gb"
+
+minNumberOfMediaNodes = 1
+maxNumberOfMediaNodes = 4
+scaleTargetCPU        = 50
+fixedNumberOfMediaNodes = 0
+
+rtcEngine = "mediasoup"
+enabledModules = "observability,openviduMeet,v2compatibility"
+
+certificateType = "letsencrypt"
+domainName       = "openvidu-do.courseultra.com"
+route53ZoneId    = "Z00112072FN6P1N2LTJK1"
+
+# Replace this documentation-only address before planning. Secrets are loaded by
+# courseultra-terraform.sh and must not be added here.
+sshAllowedCidrs = ["203.0.113.10/32"]
