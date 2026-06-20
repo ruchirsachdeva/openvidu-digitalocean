@@ -2,8 +2,8 @@
 set -euo pipefail
 
 readonly AWS_REGION="ap-south-1"
-readonly ACTIVE_TAG="courseultra-openvidu-media-node-tag"
-readonly DRAINING_TAG="courseultra-openvidu-draining"
+readonly ACTIVE_TAG="${COURSEULTRA_MEDIA_NODE_ACTIVE_TAG:-courseultra-openvidu-media-node-tag}"
+readonly DRAINING_TAG="${COURSEULTRA_MEDIA_NODE_DRAINING_TAG:-courseultra-openvidu-draining}"
 readonly DO_API="https://api.digitalocean.com/v2"
 readonly IDS_FILE="${1:-/tmp/courseultra-openvidu-old-media-node-ids}"
 
@@ -19,6 +19,13 @@ for COMMAND in aws curl jq mktemp; do
   command -v "$COMMAND" >/dev/null 2>&1 || {
     printf 'Required command is missing: %s\n' "$COMMAND" >&2
     exit 1
+  }
+done
+
+for TAG in "$ACTIVE_TAG" "$DRAINING_TAG"; do
+  [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || {
+    printf 'Media-node lifecycle tag contains unsupported characters: %s\n' "$TAG" >&2
+    exit 2
   }
 done
 

@@ -99,7 +99,7 @@ endpoint.
 
 Most CourseUltra live-session users are in India, so the replacement candidate moves the real-time
 master and media path to BLR1 while using a new private SGP1 Space only for bootstrap material and
-temporary provider recordings:
+durable provider recordings:
 
 - OpenVidu version: `3.7.0`
 - DigitalOcean compute region: `blr1`
@@ -116,9 +116,12 @@ worked, but both Terraform and a direct signed S3 `CreateBucket` request returne
 The failed probe never created a Droplet; its free partial resources and temporary key were removed.
 
 The cross-region storage path is deliberate. Live WebRTC media remains in BLR1. Only media-node
-bootstrap reads and recording uploads use SGP1; successful CourseUltra migration moves recordings
-to managed S3/CDN storage before provider cleanup. BLR-to-SGP uploads consume the pooled Droplet
-transfer allowance, and temporary Singapore storage remains relevant to customers with strict
+bootstrap reads and recording uploads use SGP1; successful CourseUltra migration copies recordings
+to managed S3/CDN storage before provider cleanup removes the provider copy. The v2 compatibility
+layer must use `V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=s3`: configuring `EXTERNAL_S3_*` alone does
+not change its default local recording store, and a master replacement could otherwise erase a
+recording before the asynchronous CourseUltra migration sees it. BLR-to-SGP uploads consume the
+pooled Droplet transfer allowance, and Singapore staging remains relevant to customers with strict
 India-only processing requirements. Do not reuse the SGP candidate's Space because each master
 publishes cluster-specific `secrets.env` at the same object key.
 
@@ -127,7 +130,7 @@ The first failed BLR1 attempt caused DigitalOcean to create that region's defaul
 does not allow deleting a region's default VPC. It is unrelated to the managed SGP1 cluster and has
 no standalone charge.
 
-## Verified candidate status
+## Verified SGP candidate status
 
 On 2026-06-18 and 2026-06-19 the deployed candidate passed:
 
@@ -152,6 +155,65 @@ The deployed master is Droplet `578687384`; the one-node media floor is Droplet 
 former media node `578469816` was drained and deleted. The infrastructure is ready for an explicit
 application cutover, but it is not the production application endpoint yet and the AWS rollback
 deployment remains untouched.
+
+## Verified BLR candidate status
+
+On 2026-06-20 the isolated BLR compute and SGP storage candidate passed:
+
+- an initial Terraform apply with 17 additions, no changes, and no deletions against its dedicated
+  state, while the SGP and AWS rollback deployments remained running;
+- master `579056037` and media node `579056194` cloud-init, service, DNS, TLS, v2 API, restart
+  recovery, autoscaler invocation, scale-out, and return to the one-node floor;
+- private bucket-scoped access to the candidate Space
+  `courseultra-openvidu-blr-space-82487d7f15`;
+- a real two-browser creator/student session with camera and microphone fixtures, attendee join,
+  hand raise, promotion, revocation, repeated refresh/rejoin, restored speaker video, explicit
+  leave, duplicate-tab recovery, and creator end-session teardown;
+- authenticated `started`, `stopped`, and `ready` recording webhooks delivered to an isolated
+  backend, followed by managed `FileAsset` migration and signed CDN delivery;
+- HTTP 206 range delivery with an MP4 `ftyp` signature for the 54,519,102-byte managed replay; and
+- deletion of only its disposable provider recording and metadata from the SGP Space, followed by
+  the same successful managed replay range request;
+- a zero-session candidate-only apply that added durable v2 S3 recording storage, replaced master
+  `579056037` with `579063522`, preserved reserved IP `144.126.253.222`, and left both rollback
+  deployments untouched;
+- generation-safe drain and deletion of media node `579056194`, followed by autoscaler creation of
+  media node `579064416` against the replacement master's ID and private IP;
+- the complete two-browser moderation and refresh/rejoin matrix on the replacement nodes;
+- a new 54,386,960-byte provider recording, authenticated webhook delivery, managed `FileAsset`
+  migration, provider deletion, and successful post-deletion CDN range playback; and
+- a post-apply drift check reporting `No changes`, plus a warm autoscaler invocation with complete
+  metrics and no error.
+
+The acceptance webhook was restored to `https://server.courseultra.com/webhooks/openvidu` after
+the test. The deployed BLR master is `579063522`, and its one-node media floor is `579064416`. The
+BLR deployment remained side by side with both rollback deployments throughout validation; that
+validation was not permission to delete either one. The later production cutover is recorded below.
+
+## Production BLR cutover
+
+On 2026-06-20 at 15:10 UTC, after both the AWS production provider and the BLR candidate reported
+zero active sessions, the generic application SSM parameters were switched to the validated BLR
+endpoint. The previous AWS values for `url`, `username`, and `secret` were labeled
+`pre-blr-cutover-20260620`; `elastic-url` did not exist before the cutover and must be deleted when
+rolling back. The backend regenerated its SSM-backed `.env`, restarted under systemd, and returned
+`UP` through the production load balancer.
+
+The production smoke test then proved the provider boundary rather than relying only on endpoint
+health:
+
+- the production backend created a room and a moderator webcam/screen credential bundle;
+- the BLR provider reported that room while the AWS provider remained at zero rooms;
+- a browser with synthetic camera and microphone media joined through the production frontend;
+- OpenVidu produced a 32-second recording and sent the authenticated production webhook;
+- CourseUltra migrated the part to a managed `FileAsset` without an error; and
+- the signed managed replay returned HTTP `206`, `video/mp4`, and an MP4 `ftyp` signature.
+
+The test room was ended and both providers returned to zero active sessions. No recording migration
+or processing work remained; the normal delayed cleanup marker for the new provider copy remained
+scheduled. The AWS and SGP deployments were intentionally left running and unmodified as rollback
+targets. Do not delete either deployment until the BLR production observation period has completed
+and a separate decommission decision has been approved.
 
 ## Secret boundaries
 
@@ -274,6 +336,22 @@ recording webhook on the new master and restarts OpenVidu. It stores host trust 
 `~/.ssh/courseultra-openvidu-elastic.known_hosts` file rather than changing the operator's ordinary
 SSH trust store.
 
+For an isolated acceptance backend, override only the endpoint for that invocation. The helper
+accepts a single HTTPS URL and still reads the shared webhook token from SSM; it never writes the
+endpoint or token into Terraform state:
+
+```bash
+COURSEULTRA_WEBHOOK_ENDPOINT=https://temporary-tunnel.example/webhooks/openvidu \
+COURSEULTRA_KNOWN_HOSTS_PATH="$HOME/.ssh/courseultra-openvidu-elastic-blr.known_hosts" \
+./configure-courseultra-webhook.sh \
+  "$HOME/.ssh/courseultra-openvidu-elastic-blr.pem"
+```
+
+Use this only while the isolated receiver is running. After acceptance, omit the override and run
+the same command again to restore the production endpoint. Both invocations restart OpenVidu, so
+first verify that the candidate has zero active rooms. Never point the production cluster at a
+temporary tunnel.
+
 After the complete application smoke matrix, recording flow, autoscaling, and rollback path have
 passed, revoke the broad Terraform token and Spaces bootstrap key. Create fresh temporary
 credentials and place them in the documented Keychain entries before any future plan, apply, or
@@ -298,23 +376,34 @@ bootstrap, drain the pre-update media nodes after the replacement master is heal
 autoscaler restore the configured floor, then verify the replacement nodes, scale-out, and graceful
 scale-in before reopening rooms.
 
+The durable v2 recording-storage setting is part of master cloud-init. Applying it to a candidate
+that was originally installed with local recording storage therefore replaces that candidate's
+master. Before this apply, finish or stop every candidate room, confirm the v2 API reports zero
+active sessions, and preserve any disposable test evidence that is still needed. Apply only the
+candidate state and require the plan to leave the SGP and AWS deployments untouched. The private
+Space and already-migrated CourseUltra assets survive the replacement; the reserved public IP also
+survives, but the SSH host key changes. Follow the media-node capture, replacement, host-key
+refresh, and drain sequence below, then repeat the browser and recording-migration acceptance
+matrix before considering application cutover.
+
 Record the current media-node IDs before applying the master replacement:
 
 ```bash
 (
   set -euo pipefail
+  ACTIVE_TAG="courseultra-openvidu-blr-media-node-tag"
   AUTOSCALER_TOKEN="$(aws ssm get-parameter \
     --region ap-south-1 \
     --name /beinghealer/prod/openvidu/digitalocean/autoscaler-token \
     --with-decryption --query Parameter.Value --output text)"
   curl -fsS \
     -H "Authorization: Bearer $AUTOSCALER_TOKEN" \
-    'https://api.digitalocean.com/v2/droplets?tag_name=courseultra-openvidu-media-node-tag&per_page=200' \
+    "https://api.digitalocean.com/v2/droplets?tag_name=$ACTIVE_TAG&per_page=200" \
     | jq -er '.droplets | if length > 0 then .[].id else error("no active media nodes") end' \
-    > /tmp/courseultra-openvidu-old-media-node-ids
-  chmod 600 /tmp/courseultra-openvidu-old-media-node-ids
+    > /tmp/courseultra-openvidu-blr-old-media-node-ids
+  chmod 600 /tmp/courseultra-openvidu-blr-old-media-node-ids
   printf 'Pre-replacement media nodes:\n'
-  cat /tmp/courseultra-openvidu-old-media-node-ids
+  cat /tmp/courseultra-openvidu-blr-old-media-node-ids
 )
 ```
 
@@ -326,23 +415,29 @@ nodes confirmed already deleted, and retains the ID file after any ambiguous fai
 command can be retried safely.
 
 ```bash
-./drain-courseultra-media-nodes.sh \
-  /tmp/courseultra-openvidu-old-media-node-ids
+COURSEULTRA_MEDIA_NODE_ACTIVE_TAG=courseultra-openvidu-blr-media-node-tag \
+COURSEULTRA_MEDIA_NODE_DRAINING_TAG=courseultra-openvidu-blr-draining \
+  ./drain-courseultra-media-nodes.sh \
+    /tmp/courseultra-openvidu-blr-old-media-node-ids
 ```
 
 The helper deletes the ID file only after every recorded node is absent or safely draining. On
 failure, fix the reported provider or response problem and rerun the same command; never remove the
 active tag manually. The autoscaler creates replacements after the old nodes leave the active
 inventory, and each new node waits until the Space contains the current master's Droplet ID and IP.
+The helper defaults to the original SGP tags for backward compatibility. A side-by-side candidate
+must pass both candidate-specific overrides shown above; unsupported tag characters fail before
+any provider request, and a node without the selected active tag is never modified.
 
 The reserved public IP survives a master replacement but the server host key does not. After the
 Terraform apply and DigitalOcean control plane both confirm that the reserved IP belongs to the new
 master, refresh only the dedicated trust entry while reconfiguring the webhook:
 
 ```bash
-./configure-courseultra-webhook.sh \
-  "$HOME/.ssh/courseultra-openvidu-elastic.pem" \
-  --refresh-host-key
+COURSEULTRA_KNOWN_HOSTS_PATH="$HOME/.ssh/courseultra-openvidu-elastic-blr.known_hosts" \
+  ./configure-courseultra-webhook.sh \
+    "$HOME/.ssh/courseultra-openvidu-elastic-blr.pem" \
+    --refresh-host-key
 ```
 
 Do not use `--refresh-host-key` for a routine webhook rerun or before independently verifying the

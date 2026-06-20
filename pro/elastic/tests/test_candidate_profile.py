@@ -14,7 +14,7 @@ class CandidateProfileTest(unittest.TestCase):
         self.assertIn('vpcIpRange = "10.10.30.0/24"', PROFILE)
         self.assertIn('domainName       = "openvidu-blr.courseultra.com"', PROFILE)
 
-    def test_keeps_live_compute_in_blr_and_temporary_storage_in_sgp(self):
+    def test_keeps_live_compute_in_blr_and_provider_storage_in_sgp(self):
         self.assertIn('region      = "blr1"', PROFILE)
         self.assertIn('spaceRegion = "sgp1"', PROFILE)
         self.assertIn('spaceName  = ""', PROFILE)

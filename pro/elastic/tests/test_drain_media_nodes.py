@@ -11,7 +11,13 @@ SCRIPT = ELASTIC_DIR / "drain-courseultra-media-nodes.sh"
 
 
 class DrainMediaNodesTest(unittest.TestCase):
-    def run_script(self, provider_failure=False, malformed_response=False):
+    def run_script(
+        self,
+        provider_failure=False,
+        malformed_response=False,
+        active_tag="courseultra-openvidu-media-node-tag",
+        draining_tag="courseultra-openvidu-draining",
+    ):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -55,14 +61,18 @@ class DrainMediaNodesTest(unittest.TestCase):
                     elif os.environ.get("TEST_MALFORMED_RESPONSE") == "1":
                         code = 200
                     else:
-                        tags = ["courseultra-openvidu-media-node-tag"]
+                        tags = [os.environ["TEST_ACTIVE_TAG"]]
                         if pathlib.Path(os.environ["TEST_DRAIN_STATE"]).exists():
-                            tags.append("courseultra-openvidu-draining")
+                            tags.append(os.environ["TEST_DRAINING_TAG"])
                         code = 200
                         payload = {"droplet": {"id": 202, "tags": tags}}
-                elif method == "POST" and url.endswith("/courseultra-openvidu-draining/resources"):
+                elif method == "POST" and url.endswith(
+                    f"/{os.environ['TEST_DRAINING_TAG']}/resources"
+                ):
                     pathlib.Path(os.environ["TEST_DRAIN_STATE"]).touch()
-                elif method == "DELETE" and url.endswith("/courseultra-openvidu-media-node-tag/resources"):
+                elif method == "DELETE" and url.endswith(
+                    f"/{os.environ['TEST_ACTIVE_TAG']}/resources"
+                ):
                     pass
                 else:
                     raise SystemExit(f"unexpected request: {method} {url}")
@@ -82,6 +92,10 @@ class DrainMediaNodesTest(unittest.TestCase):
                 "TEST_EVENT_LOG": str(event_log),
                 "TEST_MALFORMED_RESPONSE": "1" if malformed_response else "0",
                 "TEST_PROVIDER_FAILURE": "1" if provider_failure else "0",
+                "TEST_ACTIVE_TAG": active_tag,
+                "TEST_DRAINING_TAG": draining_tag,
+                "COURSEULTRA_MEDIA_NODE_ACTIVE_TAG": active_tag,
+                "COURSEULTRA_MEDIA_NODE_DRAINING_TAG": draining_tag,
             }
         )
         result = subprocess.run(
@@ -128,6 +142,29 @@ class DrainMediaNodesTest(unittest.TestCase):
         events = event_log.read_text()
         self.assertNotIn("POST", events)
         self.assertNotIn("DELETE", events)
+
+    def test_uses_isolated_candidate_lifecycle_tags(self):
+        active_tag = "courseultra-openvidu-blr-media-node-tag"
+        draining_tag = "courseultra-openvidu-blr-draining"
+
+        result, _, event_log = self.run_script(
+            active_tag=active_tag,
+            draining_tag=draining_tag,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        events = event_log.read_text()
+        self.assertIn(f"/tags/{draining_tag}/resources", events)
+        self.assertIn(f"/tags/{active_tag}/resources", events)
+        self.assertNotIn("/tags/courseultra-openvidu-draining/resources", events)
+
+    def test_rejects_unsupported_tag_before_provider_access(self):
+        result, ids_file, event_log = self.run_script(active_tag="unsafe/tag")
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("contains unsupported characters", result.stderr)
+        self.assertTrue(ids_file.exists())
+        self.assertFalse(event_log.exists())
 
 
 if __name__ == "__main__":

@@ -780,12 +780,13 @@ EOF
 
   config_s3_script_master = <<-EOF
 #!/bin/bash
-set -e
+set -euo pipefail
 umask 077
 
 # Install dir and config dir
 INSTALL_DIR="/opt/openvidu"
 CLUSTER_CONFIG_DIR="$${INSTALL_DIR}/config/cluster"
+V2_COMPATIBILITY_CONFIG="$${CLUSTER_CONFIG_DIR}/master_node/v2compatibility.env"
 
 
 # Get DigitalOcean Spaces access keys from environment or metadata
@@ -804,6 +805,23 @@ sed -i "s|EXTERNAL_S3_PATH_STYLE_ACCESS=.*|EXTERNAL_S3_PATH_STYLE_ACCESS=$EXTERN
 sed -i "s|EXTERNAL_S3_BUCKET_APP_DATA=.*|EXTERNAL_S3_BUCKET_APP_DATA=$EXTERNAL_S3_BUCKET_APP_DATA|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s|EXTERNAL_S3_ACCESS_KEY=.*|EXTERNAL_S3_ACCESS_KEY=$EXTERNAL_S3_ACCESS_KEY|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s|EXTERNAL_S3_SECRET_KEY=.*|EXTERNAL_S3_SECRET_KEY=$EXTERNAL_S3_SECRET_KEY|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
+
+# OpenVidu's external S3 settings serve cluster data, but the v2 compatibility layer otherwise
+# keeps completed recordings on the master disk. CourseUltra migrates each provider recording to
+# managed S3/CDN storage asynchronously, so the provider copy must survive a master replacement
+# until that migration and its delayed cleanup have completed.
+if [[ ! -f "$V2_COMPATIBILITY_CONFIG" ]]; then
+  echo "OpenVidu v2 compatibility configuration is missing" >&2
+  exit 1
+fi
+if ! grep -q '^V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=' "$V2_COMPATIBILITY_CONFIG"; then
+  echo "OpenVidu v2 recording storage setting is missing" >&2
+  exit 1
+fi
+sed -i \
+  's|^V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=.*|V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=s3|' \
+  "$V2_COMPATIBILITY_CONFIG"
+grep -qx 'V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=s3' "$V2_COMPATIBILITY_CONFIG"
 EOF
 
   after_install_script_master = <<-EOF

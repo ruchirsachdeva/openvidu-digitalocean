@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -31,7 +32,80 @@ def media_install_script(root):
     return script.replace("$${", "${")
 
 
+def master_s3_config_script(root):
+    terraform = TERRAFORM_FILE.read_text()
+    script = terraform.split("config_s3_script_master = <<-EOF\n", 1)[1].split(
+        "\nEOF", 1
+    )[0]
+    replacements = {
+        "${digitalocean_spaces_key.openvidu_space_key.access_key}": "test-access",
+        "${digitalocean_spaces_key.openvidu_space_key.secret_key}": "test-secret",
+        '${var.spaceName == "" ? digitalocean_spaces_bucket.openvidu_space[0].name : var.spaceName}': "test-space",
+        "${var.spaceRegion}": "test-region",
+        "/opt/openvidu": str(root / "openvidu"),
+    }
+    for placeholder, value in replacements.items():
+        script = script.replace(placeholder, value)
+    script = script.replace("$${", "${")
+    if sys.platform == "darwin":
+        script = script.replace("sed -i ", "sed -i '' ")
+    return script
+
+
 class MediaBootstrapTest(unittest.TestCase):
+    def test_master_persists_v2_recordings_in_external_s3(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cluster = root / "openvidu" / "config" / "cluster"
+            master = cluster / "master_node"
+            master.mkdir(parents=True)
+            (cluster / "openvidu.env").write_text(
+                "EXTERNAL_S3_ENDPOINT=old\n"
+                "EXTERNAL_S3_REGION=old\n"
+                "EXTERNAL_S3_PATH_STYLE_ACCESS=false\n"
+                "EXTERNAL_S3_BUCKET_APP_DATA=old\n"
+                "EXTERNAL_S3_ACCESS_KEY=old\n"
+                "EXTERNAL_S3_SECRET_KEY=old\n"
+            )
+            compatibility = master / "v2compatibility.env"
+            compatibility.write_text("V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=local\n")
+            script = root / "configure-s3.sh"
+            script.write_text(master_s3_config_script(root))
+
+            result = subprocess.run(
+                ["/bin/bash", str(script)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn(
+                "V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=s3",
+                compatibility.read_text(),
+            )
+
+    def test_master_fails_when_v2_recording_storage_setting_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cluster = root / "openvidu" / "config" / "cluster"
+            master = cluster / "master_node"
+            master.mkdir(parents=True)
+            (cluster / "openvidu.env").write_text("")
+            (master / "v2compatibility.env").write_text("OTHER_SETTING=value\n")
+            script = root / "configure-s3.sh"
+            script.write_text(master_s3_config_script(root))
+
+            result = subprocess.run(
+                ["/bin/bash", str(script)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("v2 recording storage setting is missing", result.stderr)
+
     def test_rejects_stale_secrets_when_private_ip_is_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
