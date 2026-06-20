@@ -17,7 +17,10 @@ class CandidateProfileTest(unittest.TestCase):
     def test_keeps_live_compute_in_blr_and_provider_storage_in_sgp(self):
         self.assertIn('region      = "blr1"', PROFILE)
         self.assertIn('spaceRegion = "sgp1"', PROFILE)
-        self.assertIn('spaceName  = ""', PROFILE)
+        self.assertIn(
+            'spaceName  = "courseultra-openvidu-blr-space-82487d7f15"',
+            PROFILE,
+        )
 
     def test_preserves_openvidu_runtime_shape(self):
         self.assertIn('rtcEngine      = "mediasoup"', PROFILE)

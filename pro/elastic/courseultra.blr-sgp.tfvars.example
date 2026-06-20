@@ -2,8 +2,9 @@ stackName = "courseultra-openvidu-blr"
 
 region      = "blr1"
 spaceRegion = "sgp1"
-# Keep this empty so Terraform creates a new private Space dedicated to this cluster.
-spaceName  = ""
+# Production uses this pre-created private Space because Spaces is unavailable in BLR1.
+# Change it only for an intentional side-by-side replacement with its own state and credentials.
+spaceName  = "courseultra-openvidu-blr-space-82487d7f15"
 vpcIpRange = "10.10.30.0/24"
 
 masterNodeInstanceType = "s-4vcpu-8gb"

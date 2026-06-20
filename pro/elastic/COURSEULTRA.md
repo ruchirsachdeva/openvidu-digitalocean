@@ -55,9 +55,9 @@ for launch: attendees currently remain room subscribers and one approved learner
 time. Broadcast-first delivery remains an application-level extension for a future, deliberately
 chosen large-audience threshold; it is not an infrastructure shortcut to enable here.
 
-This decision trades Singapore-to-India latency against a simpler supported topology and lower
-egress exposure. Revisit it using measured session quality and current provider pricing rather than
-preserving historical cost estimates in source control.
+This decision trades cross-region BLR-to-SGP recording staging against a simpler supported media
+topology and lower viewer-egress exposure. Revisit it using measured session quality and current
+provider pricing rather than preserving historical cost estimates in source control.
 
 ## Repository and release ownership
 
@@ -73,7 +73,7 @@ application verification. Tag every applied CourseUltra revision so disaster rec
 depend on an operator's uncommitted worktree. Frontend and backend releases consume this platform
 through SSM and may ship independently unless their OpenVidu contract changes.
 
-## Current SGP candidate shape
+## Retired SGP candidate shape
 
 - OpenVidu version: `3.7.0`
 - DigitalOcean region: `sgp1`
@@ -87,17 +87,18 @@ through SSM and may ship independently unless their OpenVidu contract changes.
 - Public endpoint: `https://openvidu-do.courseultra.com`
 - Route53 zone: `courseultra.com`
 
-The existing AWS OpenVidu cluster remains a separate rollback target until the DigitalOcean
-cluster has passed its soak period. Never destroy both deployments in one change.
+These values describe the first acceptance candidate for audit purposes only. Its Terraform state
+is empty and its provider resources were destroyed after the BLR production cutover. Do not apply
+this profile as a production recovery path.
 
-The original candidate keeps compute and storage together in SGP1. Its Space was created once
-through the control panel and is intentionally not destroyed with the cluster. Its CDN is disabled
-because OpenVidu needs authenticated S3-compatible object storage, not a public object-delivery
-endpoint.
+The original candidate kept compute and storage together in SGP1. Its Space was created through the
+control panel and therefore sat outside Terraform ownership; decommissioning deleted it explicitly
+after the Terraform stack. Its CDN remained disabled because OpenVidu needs authenticated
+S3-compatible object storage, not a public object-delivery endpoint.
 
-## Target BLR compute and SGP storage candidate
+## Production BLR compute and SGP storage
 
-Most CourseUltra live-session users are in India, so the replacement candidate moves the real-time
+Most CourseUltra live-session users are in India, so the production deployment moves the real-time
 master and media path to BLR1 while using a new private SGP1 Space only for bootstrap material and
 durable provider recordings:
 
@@ -107,8 +108,8 @@ durable provider recordings:
 - Private VPC: `10.10.30.0/24`
 - RTC engine and modules: unchanged from the SGP candidate
 - Master and media shape: unchanged, with one to four media nodes
-- Candidate endpoint: `https://openvidu-blr.courseultra.com`
-- Candidate SSM prefix: `/beinghealer/prod/openvidu/digitalocean-blr`
+- Production endpoint: `https://openvidu-blr.courseultra.com`
+- Infrastructure SSM prefix: `/beinghealer/prod/openvidu/digitalocean-blr`
 
 DigitalOcean does not offer Spaces creation in BLR1 for this account. This was rechecked on
 2026-06-20: BLR1 and the `s-4vcpu-8gb` Droplet size were available, and Functions authentication
@@ -122,7 +123,7 @@ layer must use `V2COMPAT_OPENVIDU_PRO_RECORDING_STORAGE=s3`: configuring `EXTERN
 not change its default local recording store, and a master replacement could otherwise erase a
 recording before the asynchronous CourseUltra migration sees it. BLR-to-SGP uploads consume the
 pooled Droplet transfer allowance, and Singapore staging remains relevant to customers with strict
-India-only processing requirements. Do not reuse the SGP candidate's Space because each master
+India-only processing requirements. Never share one Space between clusters because each master
 publishes cluster-specific `secrets.env` at the same object key.
 
 The first failed BLR1 attempt caused DigitalOcean to create that region's default VPC. It is named
@@ -151,10 +152,14 @@ On 2026-06-18 and 2026-06-19 the deployed candidate passed:
 - provider cleanup of the repeated-room recording while its managed replay remained available; and
 - a second post-apply drift check reporting `No changes`.
 
-The deployed master is Droplet `578687384`; the one-node media floor is Droplet `578688262`. The
-former media node `578469816` was drained and deleted. The infrastructure is ready for an explicit
-application cutover, but it is not the production application endpoint yet and the AWS rollback
-deployment remains untouched.
+The tested master was Droplet `578687384`; its final media floor was Droplet `578688262`. On
+2026-06-20, after the BLR production cutover and managed replay verification, this SGP candidate was
+decommissioned. Terraform removed both Droplets, the autoscaler Function, firewalls, tags, reserved
+IP, SSH and Spaces keys, and `openvidu-do.courseultra.com`. The external Space
+`courseultra-openvidu-space-634856ccf8` and its sole bootstrap object were deleted separately, and
+candidate-only SSM parameters were removed. DigitalOcean retains the empty SGP1 default VPC because
+the provider rejects deletion of regional default VPCs; it has no standalone charge and is outside
+Terraform state.
 
 ## Verified BLR candidate status
 
@@ -211,9 +216,8 @@ health:
 
 The test room was ended and both providers returned to zero active sessions. No recording migration
 or processing work remained; the normal delayed cleanup marker for the new provider copy remained
-scheduled. The AWS and SGP deployments were intentionally left running and unmodified as rollback
-targets. Do not delete either deployment until the BLR production observation period has completed
-and a separate decommission decision has been approved.
+scheduled. AWS remains the independent rollback deployment. The acceptance-only SGP DigitalOcean
+candidate was later removed as recorded above; it is not a rollback target.
 
 ## Secret boundaries
 
@@ -221,11 +225,11 @@ and a separate decommission decision has been approved.
 
 | Input | Source |
 | --- | --- |
-| Terraform DigitalOcean token | macOS Keychain service `courseultra-do-terraform-token` |
-| Spaces bootstrap access ID | macOS Keychain service `courseultra-do-spaces-access-id` |
-| Spaces bootstrap secret | macOS Keychain service `courseultra-do-spaces-secret-key` |
-| BLR candidate bootstrap access ID | macOS Keychain service `courseultra-do-blr-bootstrap-access-id` |
-| BLR candidate bootstrap secret | macOS Keychain service `courseultra-do-blr-bootstrap-secret-key` |
+| Temporary Terraform DigitalOcean token | macOS Keychain service `courseultra-do-terraform-token` |
+| Temporary generic Spaces bootstrap access ID | macOS Keychain service `courseultra-do-spaces-access-id` |
+| Temporary generic Spaces bootstrap secret | macOS Keychain service `courseultra-do-spaces-secret-key` |
+| Temporary BLR bootstrap access ID | macOS Keychain service `courseultra-do-blr-bootstrap-access-id` |
+| Temporary BLR bootstrap secret | macOS Keychain service `courseultra-do-blr-bootstrap-secret-key` |
 | Scoped autoscaler token | SSM `/beinghealer/prod/openvidu/digitalocean/autoscaler-token` |
 | OpenVidu PRO license | SSM `/beinghealer/prod/openvidu/pro-license` |
 
@@ -233,16 +237,21 @@ Do not add these values to `*.tfvars`, Git, saved plans, shell tracing, tickets,
 The state itself is sensitive because OpenVidu cloud-init and the autoscaler require generated
 credentials. The S3 backend must remain private and versioned.
 
+The Terraform and bootstrap Keychain entries are intentionally absent between infrastructure
+changes. Create short-lived credentials for a reviewed plan/apply/destroy, revoke them after the
+operation, and remove their Keychain entries. The scoped autoscaler token and OpenVidu license are
+the only long-lived entries in this table.
+
 ## One-time workstation and state setup
 
 Install Terraform `1.10` or newer and authenticate the AWS CLI to account `408669273539`. The
 remote state bucket is `courseultra-terraform-state-408669273539-ap-south-1`; it must remain private,
-AES-256 encrypted, versioned, TLS-only, and protected by the S3 public-access block. Then create
-local files from the committed examples:
+AES-256 encrypted, versioned, TLS-only, and protected by the S3 public-access block. For the current
+BLR production state, create local files from the committed BLR/SGP examples:
 
 ```bash
-cp backend.hcl.example backend.hcl
-cp courseultra.auto.tfvars.example courseultra.auto.tfvars
+cp backend.blr-sgp.hcl.example backend.hcl
+cp courseultra.blr-sgp.tfvars.example courseultra.auto.tfvars
 ```
 
 Set the real state bucket in `backend.hcl`. Replace the documentation CIDR in
@@ -250,14 +259,10 @@ Set the real state bucket in `backend.hcl`. Replace the documentation CIDR in
 rejects IPv4 and IPv6 `/0` routes so SSH cannot accidentally be reopened to the entire internet.
 Neither local file is committed.
 
-For a side-by-side regional candidate, use a separate worktree, backend state key, stack name, VPC
-CIDR, Space, hostname, SSM prefix, SSH key, and known-hosts file. Do not replace the existing SGP
-credentials or artifacts. Start from the committed BLR/SGP examples:
-
-```bash
-cp backend.blr-sgp.hcl.example backend.hcl
-cp courseultra.blr-sgp.tfvars.example courseultra.auto.tfvars
-```
+The generic examples describe the retired SGP profile and must not be applied as a production
+recovery. For a future side-by-side candidate, use a separate worktree and choose a new backend
+state key, stack name, VPC CIDR, Space, hostname, SSM prefix, SSH key, lifecycle tags, and
+known-hosts file. Never point a candidate at the active BLR state or Space.
 
 Replace the documentation SSH CIDR before planning. A new Space needs a short-lived full-access
 Spaces key; store it under candidate-specific Keychain service names and select them only for the
@@ -269,9 +274,9 @@ COURSEULTRA_SPACES_SECRET_KEY_KEYCHAIN_SERVICE=courseultra-do-blr-bootstrap-secr
 ./courseultra-terraform.sh apply
 ```
 
-After Terraform creates the candidate Space and its permanent bucket-scoped key, delete the
-full-access bootstrap key and its two candidate Keychain entries. The default service names remain
-the SGP deployment's credentials.
+After Terraform creates the required Space resources and permanent bucket-scoped key, delete the
+full-access bootstrap key and its two Keychain entries. The generic Spaces Keychain service names
+belonged to the retired SGP deployment and are intentionally absent.
 
 The autoscaler token requires only the operations used by the runtime: Droplet read/create/update/
 delete, Monitoring read, Tag read/create/delete, and the required Region, Size, Action, Image, VPC,
@@ -447,7 +452,7 @@ When rotating the autoscaler token, every media node bootstrapped with the old t
 drained and replaced before revoking it. A Terraform apply updates the Function and future
 media-node bootstrap; it cannot rewrite credentials already stored on running Droplets.
 
-## Application cutover
+## Application cutover and rollback
 
 Before changing production SSM:
 
@@ -463,9 +468,13 @@ the generated `LIVEKIT_API_SECRET`, then reload and restart the backend. The web
 unchanged. Existing managed `FileAsset` recordings remain in CourseUltra storage and are not moved
 to DigitalOcean.
 
-Rollback means restoring the recorded SSM versions and restarting the backend. The Route53 record
-for `openvidu-do.courseultra.com` and the DigitalOcean cluster can remain available while the issue
-is investigated; the old `openvidu.courseultra.com` deployment is not modified during cutover.
+The 2026-06-20 cutover is complete. Its supported rollback restores the AWS values labeled
+`pre-blr-cutover-20260620` for `url`, `username`, and `secret`, deletes the generic `elastic-url`
+parameter that did not exist before cutover, then reloads SSM and restarts the backend. Confirm zero
+active BLR rooms and drain any recording migration/cleanup work before switching. The AWS
+`openvidu.courseultra.com` deployment remains intact; the acceptance-only
+`openvidu-do.courseultra.com` SGP deployment has been decommissioned and must not be used for
+rollback.
 
 ## Upgrade discipline
 
