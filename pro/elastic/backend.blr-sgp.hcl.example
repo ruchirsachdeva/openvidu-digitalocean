@@ -1,0 +1,5 @@
+bucket       = "courseultra-terraform-state-408669273539-ap-south-1"
+key          = "openvidu/digitalocean/elastic-3.7.0-blr-sgp.tfstate"
+region       = "ap-south-1"
+encrypt      = true
+use_lockfile = true

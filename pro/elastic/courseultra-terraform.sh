@@ -3,6 +3,8 @@ set -euo pipefail
 
 readonly AWS_REGION="ap-south-1"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SPACES_ACCESS_ID_KEYCHAIN_SERVICE="${COURSEULTRA_SPACES_ACCESS_ID_KEYCHAIN_SERVICE:-courseultra-do-spaces-access-id}"
+readonly SPACES_SECRET_KEY_KEYCHAIN_SERVICE="${COURSEULTRA_SPACES_SECRET_KEY_KEYCHAIN_SERVICE:-courseultra-do-spaces-secret-key}"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -76,8 +78,8 @@ require_command security
 # which would otherwise let plan/apply continue with empty infrastructure credentials.
 COURSEULTRA_DO_PROVISIONING_TOKEN="$(keychain_value courseultra-do-terraform-token)"
 COURSEULTRA_DO_AUTOSCALER_TOKEN="$(ssm_value /beinghealer/prod/openvidu/digitalocean/autoscaler-token)"
-TF_VAR_spacesAccessId="$(keychain_value courseultra-do-spaces-access-id)"
-TF_VAR_spacesSecretKey="$(keychain_value courseultra-do-spaces-secret-key)"
+TF_VAR_spacesAccessId="$(keychain_value "$SPACES_ACCESS_ID_KEYCHAIN_SERVICE")"
+TF_VAR_spacesSecretKey="$(keychain_value "$SPACES_SECRET_KEY_KEYCHAIN_SERVICE")"
 TF_VAR_openviduLicense="$(ssm_value /beinghealer/prod/openvidu/pro-license)"
 
 require_value "DigitalOcean provisioning token" "$COURSEULTRA_DO_PROVISIONING_TOKEN"

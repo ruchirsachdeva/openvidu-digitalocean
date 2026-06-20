@@ -73,7 +73,7 @@ application verification. Tag every applied CourseUltra revision so disaster rec
 depend on an operator's uncommitted worktree. Frontend and backend releases consume this platform
 through SSM and may ship independently unless their OpenVidu contract changes.
 
-## Fixed production shape
+## Current SGP candidate shape
 
 - OpenVidu version: `3.7.0`
 - DigitalOcean region: `sgp1`
@@ -90,11 +90,37 @@ through SSM and may ship independently unless their OpenVidu contract changes.
 The existing AWS OpenVidu cluster remains a separate rollback target until the DigitalOcean
 cluster has passed its soak period. Never destroy both deployments in one change.
 
-Singapore is used because DigitalOcean currently disables new Spaces creation in BLR1. Keeping
-compute and Spaces together in SGP1 avoids cross-region bootstrap and recording traffic. The Space
-was created once through the control panel and is intentionally not destroyed with the cluster.
-Its CDN is disabled because OpenVidu needs authenticated S3-compatible object storage, not a public
-object-delivery endpoint.
+The original candidate keeps compute and storage together in SGP1. Its Space was created once
+through the control panel and is intentionally not destroyed with the cluster. Its CDN is disabled
+because OpenVidu needs authenticated S3-compatible object storage, not a public object-delivery
+endpoint.
+
+## Target BLR compute and SGP storage candidate
+
+Most CourseUltra live-session users are in India, so the replacement candidate moves the real-time
+master and media path to BLR1 while using a new private SGP1 Space only for bootstrap material and
+temporary provider recordings:
+
+- OpenVidu version: `3.7.0`
+- DigitalOcean compute region: `blr1`
+- DigitalOcean Spaces region: `sgp1`
+- Private VPC: `10.10.30.0/24`
+- RTC engine and modules: unchanged from the SGP candidate
+- Master and media shape: unchanged, with one to four media nodes
+- Candidate endpoint: `https://openvidu-blr.courseultra.com`
+- Candidate SSM prefix: `/beinghealer/prod/openvidu/digitalocean-blr`
+
+DigitalOcean does not offer Spaces creation in BLR1 for this account. This was rechecked on
+2026-06-20: BLR1 and the `s-4vcpu-8gb` Droplet size were available, and Functions authentication
+worked, but both Terraform and a direct signed S3 `CreateBucket` request returned `AccessDenied`.
+The failed probe never created a Droplet; its free partial resources and temporary key were removed.
+
+The cross-region storage path is deliberate. Live WebRTC media remains in BLR1. Only media-node
+bootstrap reads and recording uploads use SGP1; successful CourseUltra migration moves recordings
+to managed S3/CDN storage before provider cleanup. BLR-to-SGP uploads consume the pooled Droplet
+transfer allowance, and temporary Singapore storage remains relevant to customers with strict
+India-only processing requirements. Do not reuse the SGP candidate's Space because each master
+publishes cluster-specific `secrets.env` at the same object key.
 
 The first failed BLR1 attempt caused DigitalOcean to create that region's default VPC. It is named
 `default-blr1`, has no droplets, and is intentionally outside Terraform state because DigitalOcean
@@ -136,6 +162,8 @@ deployment remains untouched.
 | Terraform DigitalOcean token | macOS Keychain service `courseultra-do-terraform-token` |
 | Spaces bootstrap access ID | macOS Keychain service `courseultra-do-spaces-access-id` |
 | Spaces bootstrap secret | macOS Keychain service `courseultra-do-spaces-secret-key` |
+| BLR candidate bootstrap access ID | macOS Keychain service `courseultra-do-blr-bootstrap-access-id` |
+| BLR candidate bootstrap secret | macOS Keychain service `courseultra-do-blr-bootstrap-secret-key` |
 | Scoped autoscaler token | SSM `/beinghealer/prod/openvidu/digitalocean/autoscaler-token` |
 | OpenVidu PRO license | SSM `/beinghealer/prod/openvidu/pro-license` |
 
@@ -159,6 +187,29 @@ Set the real state bucket in `backend.hcl`. Replace the documentation CIDR in
 `courseultra.auto.tfvars` with the current operator public IP as `/32`. The Terraform validation
 rejects IPv4 and IPv6 `/0` routes so SSH cannot accidentally be reopened to the entire internet.
 Neither local file is committed.
+
+For a side-by-side regional candidate, use a separate worktree, backend state key, stack name, VPC
+CIDR, Space, hostname, SSM prefix, SSH key, and known-hosts file. Do not replace the existing SGP
+credentials or artifacts. Start from the committed BLR/SGP examples:
+
+```bash
+cp backend.blr-sgp.hcl.example backend.hcl
+cp courseultra.blr-sgp.tfvars.example courseultra.auto.tfvars
+```
+
+Replace the documentation SSH CIDR before planning. A new Space needs a short-lived full-access
+Spaces key; store it under candidate-specific Keychain service names and select them only for the
+candidate Terraform command:
+
+```bash
+COURSEULTRA_SPACES_ACCESS_ID_KEYCHAIN_SERVICE=courseultra-do-blr-bootstrap-access-id \
+COURSEULTRA_SPACES_SECRET_KEY_KEYCHAIN_SERVICE=courseultra-do-blr-bootstrap-secret-key \
+./courseultra-terraform.sh apply
+```
+
+After Terraform creates the candidate Space and its permanent bucket-scoped key, delete the
+full-access bootstrap key and its two candidate Keychain entries. The default service names remain
+the SGP deployment's credentials.
 
 The autoscaler token requires only the operations used by the runtime: Droplet read/create/update/
 delete, Monitoring read, Tag read/create/delete, and the required Region, Size, Action, Image, VPC,
@@ -192,13 +243,21 @@ Let's Encrypt certificate. The autoscaler runs every four minutes and creates me
 the configured minimum is reached. Do not cut the application over while cloud-init or the first
 media-node installation is still running.
 
-After the apply:
+After applying the BLR/SGP candidate, keep every generated artifact and SSM parameter isolated:
 
 ```bash
+COURSEULTRA_OPENVIDU_SSM_PREFIX=/beinghealer/prod/openvidu/digitalocean-blr \
 ./persist-runtime-secrets.sh
-./secure-bootstrap-artifacts.sh
+
+./secure-bootstrap-artifacts.sh \
+  "$HOME/.ssh/courseultra-openvidu-elastic-blr.pem"
+
+COURSEULTRA_OPENVIDU_SSM_PREFIX=/beinghealer/prod/openvidu/digitalocean-blr \
 ./persist-openvidu-candidate.sh
-./configure-courseultra-webhook.sh
+
+COURSEULTRA_KNOWN_HOSTS_PATH="$HOME/.ssh/courseultra-openvidu-elastic-blr.known_hosts" \
+./configure-courseultra-webhook.sh \
+  "$HOME/.ssh/courseultra-openvidu-elastic-blr.pem"
 ```
 
 The first command writes the generated, bucket-scoped Spaces credentials to SSM. The second
@@ -208,9 +267,9 @@ the script also removes the legacy bootstrap object when upgrading an older cand
 `secrets.env` must remain private in Spaces because new autoscaled media nodes use it during
 bootstrap.
 
-The third command copies the generated v2-compatible URL, username, and secret into
-`/beinghealer/prod/openvidu/digitalocean/*` candidate parameters. It does not overwrite the live
-application parameters. The fourth command configures the existing authenticated CourseUltra
+The third command copies the generated v2-compatible URL, username, and secret into the selected
+candidate SSM prefix. It does not overwrite the SGP candidate or live application parameters. The
+fourth command configures the existing authenticated CourseUltra
 recording webhook on the new master and restarts OpenVidu. It stores host trust in the dedicated
 `~/.ssh/courseultra-openvidu-elastic.known_hosts` file rather than changing the operator's ordinary
 SSH trust store.

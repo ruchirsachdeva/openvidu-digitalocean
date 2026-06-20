@@ -1,0 +1,25 @@
+stackName = "courseultra-openvidu-blr"
+
+region      = "blr1"
+spaceRegion = "sgp1"
+# Keep this empty so Terraform creates a new private Space dedicated to this cluster.
+spaceName  = ""
+vpcIpRange = "10.10.30.0/24"
+
+masterNodeInstanceType = "s-4vcpu-8gb"
+mediaNodeInstanceType  = "s-4vcpu-8gb"
+
+minNumberOfMediaNodes   = 1
+maxNumberOfMediaNodes   = 4
+scaleTargetCPU          = 50
+fixedNumberOfMediaNodes = 0
+
+rtcEngine      = "mediasoup"
+enabledModules = "observability,openviduMeet,v2compatibility"
+
+certificateType = "letsencrypt"
+domainName       = "openvidu-blr.courseultra.com"
+route53ZoneId    = "Z00112072FN6P1N2LTJK1"
+
+# Replace this documentation-only address before planning.
+sshAllowedCidrs = ["203.0.113.10/32"]

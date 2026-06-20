@@ -81,6 +81,7 @@ class PersistOpenViduCandidateTest(unittest.TestCase):
                     "TERRAFORM_WRAPPER": str(wrapper),
                     "TEST_ATTEMPTS": str(attempts),
                     "TEST_AWS_LOG": str(aws_log),
+                    "COURSEULTRA_OPENVIDU_SSM_PREFIX": "/test/openvidu/blr",
                 }
             )
             result = subprocess.run(
@@ -96,6 +97,35 @@ class PersistOpenViduCandidateTest(unittest.TestCase):
             calls = aws_log.read_text()
             self.assertIn("current-secret", calls)
             self.assertNotIn("stale-secret", calls)
+            self.assertIn("/test/openvidu/blr/url", calls)
+            self.assertIn("/test/openvidu/blr/elastic-url", calls)
+            self.assertIn("/test/openvidu/blr/username", calls)
+            self.assertIn("/test/openvidu/blr/secret", calls)
+            self.assertNotIn("/beinghealer/prod/openvidu/digitalocean/", calls)
+
+    def test_rejects_malformed_candidate_prefix_before_reading_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wrapper = Path(directory) / "terraform-wrapper"
+            wrapper.write_text("#!/usr/bin/env sh\nexit 99\n")
+            wrapper.chmod(0o700)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "TERRAFORM_WRAPPER": str(wrapper),
+                    "COURSEULTRA_OPENVIDU_SSM_PREFIX": "/test/openvidu/",
+                }
+            )
+            result = subprocess.run(
+                [str(SCRIPT)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(2, result.returncode)
+            self.assertIn("COURSEULTRA_OPENVIDU_SSM_PREFIX", result.stderr)
 
 
 if __name__ == "__main__":

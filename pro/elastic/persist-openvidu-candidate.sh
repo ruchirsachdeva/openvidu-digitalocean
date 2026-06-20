@@ -4,6 +4,26 @@ set -euo pipefail
 readonly AWS_REGION="ap-south-1"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly TERRAFORM_WRAPPER="${TERRAFORM_WRAPPER:-$SCRIPT_DIR/courseultra-terraform.sh}"
+readonly SSM_PREFIX="${COURSEULTRA_OPENVIDU_SSM_PREFIX:-/beinghealer/prod/openvidu/digitalocean}"
+readonly URL_PARAMETER="$SSM_PREFIX/url"
+readonly ELASTIC_URL_PARAMETER="$SSM_PREFIX/elastic-url"
+readonly USERNAME_PARAMETER="$SSM_PREFIX/username"
+readonly SECRET_PARAMETER="$SSM_PREFIX/secret"
+
+case "$SSM_PREFIX" in
+  /*) ;;
+  *)
+    printf 'COURSEULTRA_OPENVIDU_SSM_PREFIX must be an absolute SSM path\n' >&2
+    exit 2
+    ;;
+esac
+
+case "$SSM_PREFIX" in
+  "/"|*/|*//*|*[!A-Za-z0-9_./-]*)
+    printf 'COURSEULTRA_OPENVIDU_SSM_PREFIX contains an invalid SSM path\n' >&2
+    exit 2
+    ;;
+esac
 
 cleanup() {
   unset SPACES_ACCESS_ID SPACES_SECRET_KEY OPENVIDU_URL LIVEKIT_API_SECRET
@@ -58,10 +78,10 @@ if [ "$SECRETS_FOUND" != "true" ]; then
   exit 1
 fi
 
-for parameter_name in url elastic-url; do
+for parameter_name in "$URL_PARAMETER" "$ELASTIC_URL_PARAMETER"; do
   aws ssm put-parameter \
     --region "$AWS_REGION" \
-    --name "/beinghealer/prod/openvidu/digitalocean/$parameter_name" \
+    --name "$parameter_name" \
     --type SecureString \
     --value "$OPENVIDU_URL" \
     --overwrite >/dev/null
@@ -69,14 +89,14 @@ done
 
 aws ssm put-parameter \
   --region "$AWS_REGION" \
-  --name "/beinghealer/prod/openvidu/digitalocean/username" \
+  --name "$USERNAME_PARAMETER" \
   --type SecureString \
   --value OPENVIDUAPP \
   --overwrite >/dev/null
 
 aws ssm put-parameter \
   --region "$AWS_REGION" \
-  --name "/beinghealer/prod/openvidu/digitalocean/secret" \
+  --name "$SECRET_PARAMETER" \
   --type SecureString \
   --value "$LIVEKIT_API_SECRET" \
   --overwrite >/dev/null
@@ -84,9 +104,9 @@ aws ssm put-parameter \
 aws ssm get-parameters \
   --region "$AWS_REGION" \
   --names \
-    /beinghealer/prod/openvidu/digitalocean/url \
-    /beinghealer/prod/openvidu/digitalocean/elastic-url \
-    /beinghealer/prod/openvidu/digitalocean/username \
-    /beinghealer/prod/openvidu/digitalocean/secret \
+    "$URL_PARAMETER" \
+    "$ELASTIC_URL_PARAMETER" \
+    "$USERNAME_PARAMETER" \
+    "$SECRET_PARAMETER" \
   --query 'Parameters[].{Name:Name,Type:Type,Version:Version}' \
   --output table

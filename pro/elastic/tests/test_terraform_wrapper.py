@@ -40,6 +40,8 @@ class TerraformWrapperTest(unittest.TestCase):
                   *courseultra-do-terraform-token*) printf 'provisioning-token' ;;
                   *courseultra-do-spaces-access-id*) printf 'spaces-access' ;;
                   *courseultra-do-spaces-secret-key*) printf 'spaces-secret' ;;
+                  *courseultra-do-blr-bootstrap-access-id*) printf 'blr-spaces-access' ;;
+                  *courseultra-do-blr-bootstrap-secret-key*) printf 'blr-spaces-secret' ;;
                   *) exit 1 ;;
                 esac
             """,
@@ -112,6 +114,30 @@ class TerraformWrapperTest(unittest.TestCase):
             calls,
         )
         self.assertFalse(any(call.startswith("TF_LOG") for call in calls))
+
+    def test_plan_can_use_isolated_spaces_keychain_services(self):
+        self.env["COURSEULTRA_SPACES_ACCESS_ID_KEYCHAIN_SERVICE"] = (
+            "courseultra-do-blr-bootstrap-access-id"
+        )
+        self.env["COURSEULTRA_SPACES_SECRET_KEY_KEYCHAIN_SERVICE"] = (
+            "courseultra-do-blr-bootstrap-secret-key"
+        )
+
+        result = self.run_wrapper("plan", "-input=false")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = self.command_log.read_text().splitlines()
+        self.assertTrue(
+            any("courseultra-do-blr-bootstrap-access-id" in call for call in calls)
+        )
+        self.assertTrue(
+            any("courseultra-do-blr-bootstrap-secret-key" in call for call in calls)
+        )
+        self.assertIn(
+            "provisioning-token|autoscaler-token|openvidu-license|"
+            "blr-spaces-access|blr-spaces-secret",
+            calls,
+        )
 
     def test_plan_never_runs_when_a_credential_lookup_fails(self):
         for source in ("security", "aws"):
