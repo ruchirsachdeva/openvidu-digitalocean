@@ -1,0 +1,42 @@
+# Fresh-master bootstrap candidate: merge without replacing Meet.
+# Existing masters require a separate, backed-up data migration.
+# September 12 qualification found native egress history lost when compose down
+# recreated Redis: its /data directory lived only in the container writable layer.
+# Migrate and verify the current dataset BEFORE enabling this mount. An empty
+# directory is not a recovery. Keep backups outside the droplet as well.
+# IMPORTANT: Redis 8.6.2 did not load an RDB-only copy when AOF was enabled on its
+# first start. First load the preserved RDB with AOF off, enable AOF at runtime,
+# wait for its initial rewrite to finish, and only then use this final setting.
+services:
+  redis:
+    volumes:
+      - type: bind
+        source: ./data/redis
+        target: /data
+        bind:
+          create_host_path: false
+    stop_grace_period: 60s
+    # The vendor entrypoint does not accept extra arguments, so retain its env,
+    # authentication, thread and client-limit behavior here, adding only durable
+    # storage options and explicit exec for graceful shutdown. TODO: compare this
+    # block with the vendor definition on every OpenVidu upgrade and remove the
+    # override only when upstream persistence and restart-survival tests pass.
+    entrypoint: >
+      /bin/sh -c '
+        . /config/redis.env &&
+        NUM_IO_THREADS=$${REDIS_IO_THREADS:-0} &&
+        if [ $$NUM_IO_THREADS -le 0 ]; then
+          NUM_IO_THREADS=$(expr $(nproc) / 2)
+          if [ $$NUM_IO_THREADS -lt 1 ]; then
+            NUM_IO_THREADS=1
+          fi
+        fi &&
+        exec docker-entrypoint.sh redis-server \
+          --port $${REDIS_INTERNAL_PORT} \
+          --requirepass "$${REDIS_PASSWORD}" \
+          --io-threads $$NUM_IO_THREADS \
+          --maxclients 250000 \
+          --dir /data \
+          --appendonly yes \
+          --appendfsync everysec
+      '

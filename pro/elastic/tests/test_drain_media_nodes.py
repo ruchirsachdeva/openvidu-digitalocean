@@ -113,6 +113,9 @@ class DrainMediaNodesTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("101 is already absent", result.stdout)
         self.assertIn("202 is draining", result.stdout)
+        self.assertIn("exclusion awaits the node watcher", result.stdout)
+        self.assertNotIn("no longer accepts", result.stdout)
+        self.assertNotIn("safely draining", result.stdout)
         self.assertFalse(ids_file.exists())
         self.assertEqual(
             [

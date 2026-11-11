@@ -125,7 +125,7 @@ class CleanupScriptsTest(unittest.TestCase):
 
     def test_functions_cleanup_uses_current_provisioning_token(self):
         result, curl_log = self.run_cleanup(
-            "deploy_autoscaler_function", "COURSEULTRA_DO_PROVISIONING_TOKEN"
+            "autoscaler_lifecycle", "COURSEULTRA_DO_PROVISIONING_TOKEN"
         )
 
         self.assertEqual(0, result.returncode, result.stderr)
@@ -134,7 +134,7 @@ class CleanupScriptsTest(unittest.TestCase):
 
     def test_functions_cleanup_accepts_provider_null_for_empty_inventory(self):
         result, _ = self.run_cleanup(
-            "deploy_autoscaler_function",
+            "autoscaler_lifecycle",
             "COURSEULTRA_DO_PROVISIONING_TOKEN",
             null_namespace_inventory=True,
         )
@@ -145,7 +145,7 @@ class CleanupScriptsTest(unittest.TestCase):
     def test_cleanup_fails_closed_on_provider_error(self):
         for resource_name, token_name in (
             ("cleanup_media_nodes", "COURSEULTRA_DO_AUTOSCALER_TOKEN"),
-            ("deploy_autoscaler_function", "COURSEULTRA_DO_PROVISIONING_TOKEN"),
+            ("autoscaler_lifecycle", "COURSEULTRA_DO_PROVISIONING_TOKEN"),
         ):
             with self.subTest(resource_name=resource_name):
                 result, _ = self.run_cleanup(
@@ -156,7 +156,7 @@ class CleanupScriptsTest(unittest.TestCase):
     def test_cleanup_fails_closed_on_malformed_success_response(self):
         for resource_name, token_name in (
             ("cleanup_media_nodes", "COURSEULTRA_DO_AUTOSCALER_TOKEN"),
-            ("deploy_autoscaler_function", "COURSEULTRA_DO_PROVISIONING_TOKEN"),
+            ("autoscaler_lifecycle", "COURSEULTRA_DO_PROVISIONING_TOKEN"),
         ):
             with self.subTest(resource_name=resource_name):
                 result, _ = self.run_cleanup(

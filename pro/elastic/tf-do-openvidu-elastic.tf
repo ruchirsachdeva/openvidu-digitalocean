@@ -244,7 +244,20 @@ resource "digitalocean_droplet" "openvidu_master_node" {
   vpc_uuid = digitalocean_vpc.openvidu_vpc.id
   tags     = ["openvidu", var.stackName, "master-node"]
 
-  user_data = local.user_data_master
+  user_data = local.user_data_master_transport
+
+  lifecycle {
+    precondition {
+      condition     = length(local.user_data_master_transport) <= 65536
+      error_message = "Encoded master startup exceeds the provider user-data limit."
+    }
+    # A provider create can return an ID before its private address is populated.
+    # Do not bake an empty IP into media startup/drain or autoscaler user data.
+    postcondition {
+      condition     = can(cidrnetmask("${self.ipv4_address_private}/32"))
+      error_message = "Master private IPv4 is unavailable or invalid. Reconcile the created master and refresh its provider observation before replanning; do not recreate it or bypass the media generation guard."
+    }
+  }
 }
 
 # Master Node IP
@@ -266,7 +279,13 @@ resource "digitalocean_droplet" "openvidu_media_nodes" {
   vpc_uuid = digitalocean_vpc.openvidu_vpc.id
   tags     = ["openvidu", var.stackName, "media-node", digitalocean_tag.media_node_tag.name]
 
-  user_data = local.user_data_media
+  user_data = local.user_data_media_transport
+  lifecycle {
+    precondition {
+      condition     = length(local.user_data_media_transport) <= 65536
+      error_message = "Encoded media startup exceeds the provider user-data limit."
+    }
+  }
 }
 
 # Cleanup all media nodes on destroy (created by autoscaler outside Terraform state)
@@ -346,6 +365,139 @@ resource "null_resource" "cleanup_media_nodes" {
 }
 
 # -------------- Autoscaler (DO Function) ----------------
+
+resource "null_resource" "autoscaler_lifecycle" {
+  count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
+  # Code updates overwrite the existing action. Namespace destruction belongs
+  # only to stack removal; tying it to code_hash interrupted scaling on updates.
+  triggers = {
+    stack_name = var.stackName
+    region     = var.region
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = <<-EOT
+      set -eu
+
+      DO_API="https://api.digitalocean.com/v2"
+      TOKEN="$${COURSEULTRA_DO_PROVISIONING_TOKEN:-}"
+      LABEL="${self.triggers.stack_name}-autoscaler"
+      TRIGGER="${self.triggers.stack_name}-autoscale-cron"
+
+      [ -n "$TOKEN" ] || {
+        echo "ERROR: use courseultra-terraform.sh so Functions cleanup receives a current provisioning token" >&2
+        exit 1
+      }
+
+      for COMMAND in curl jq base64; do
+        command -v "$COMMAND" >/dev/null 2>&1 || {
+          echo "ERROR: $COMMAND is required for Functions cleanup" >&2
+          exit 1
+        }
+      done
+
+      delete_allow_missing() {
+        AUTH_HEADER="$1"
+        URL="$2"
+        HTTP_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' -X DELETE \
+          -H "$AUTH_HEADER" "$URL")
+        case "$HTTP_CODE" in
+          2??|404) return 0 ;;
+          *)
+            echo "ERROR: DELETE $URL returned HTTP $HTTP_CODE" >&2
+            return 1
+            ;;
+        esac
+      }
+
+      echo "=== Destroying autoscaler function ==="
+      echo "Looking for namespace with label: $LABEL"
+
+      NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
+      printf '%s' "$NS_LIST" | jq -e \
+        'has("namespaces")
+          and ((.namespaces == null)
+            or ((.namespaces | type) == "array"
+              and all(.namespaces[];
+                type == "object"
+                and (.label | type) == "string"
+                and (.namespace | type) == "string")))' >/dev/null || {
+        echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
+        exit 1
+      }
+      NS_ID=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
+        '[(.namespaces // [])[] | select(.label == $l)] | .[0].namespace // empty')
+
+      if [ -z "$NS_ID" ]; then
+        echo "No namespace found with label $LABEL — nothing to destroy."
+        exit 0
+      fi
+
+      echo "Found namespace: $NS_ID"
+      NS_DETAIL=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces/$NS_ID")
+      NS_UUID=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.uuid // empty')
+      API_HOST=$(printf '%s' "$NS_DETAIL" | jq -r '.namespace.api_host // empty')
+      API_KEY=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.key // empty')
+
+      # Delete cron trigger
+      echo "Deleting trigger $TRIGGER ..."
+      delete_allow_missing "Authorization: Bearer $TOKEN" \
+        "$DO_API/functions/namespaces/$NS_ID/triggers/$TRIGGER"
+
+      # Delete action + package via OpenWhisk API
+      if [ -n "$API_HOST" ] && [ -n "$NS_UUID" ] && [ -n "$API_KEY" ]; then
+        OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 | tr -d '\n')
+        echo "Deleting action autoscaler/check ..."
+        delete_allow_missing "Authorization: Basic $OW_AUTH" \
+          "$API_HOST/api/v1/namespaces/_/actions/autoscaler/check"
+        echo "Deleting package autoscaler ..."
+        delete_allow_missing "Authorization: Basic $OW_AUTH" \
+          "$API_HOST/api/v1/namespaces/_/packages/autoscaler"
+      else
+        echo "OpenWhisk credentials unavailable; namespace deletion will remove its contents"
+      fi
+
+      # Delete the namespace itself
+      echo "Deleting namespace $NS_ID ..."
+      delete_allow_missing "Authorization: Bearer $TOKEN" \
+        "$DO_API/functions/namespaces/$NS_ID"
+
+      ATTEMPT=1
+      while [ "$ATTEMPT" -le 30 ]; do
+        NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
+        printf '%s' "$NS_LIST" | jq -e \
+          'has("namespaces")
+            and ((.namespaces == null)
+              or ((.namespaces | type) == "array"
+                and all(.namespaces[];
+                  type == "object"
+                  and (.label | type) == "string"
+                  and (.namespace | type) == "string")))' >/dev/null || {
+          echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
+          exit 1
+        }
+        MATCHES=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
+          '[(.namespaces // [])[] | select(.label == $l)] | length')
+        if [ "$MATCHES" -eq 0 ]; then
+          echo "Verified namespace removal: $LABEL"
+          echo "=== Autoscaler function destroyed ==="
+          exit 0
+        fi
+        sleep 2
+        ATTEMPT=$((ATTEMPT + 1))
+      done
+
+      echo "ERROR: Functions namespace $LABEL still exists after cleanup" >&2
+      exit 1
+    EOT
+  }
+
+  depends_on = [
+    null_resource.cleanup_media_nodes,
+  ]
+}
+
 
 resource "null_resource" "deploy_autoscaler_function" {
   count = var.fixedNumberOfMediaNodes > 0 ? 0 : 1
@@ -474,126 +626,10 @@ resource "null_resource" "deploy_autoscaler_function" {
     EOT
   }
 
-  provisioner "local-exec" {
-    when    = destroy
-    command = <<-EOT
-      set -eu
-
-      DO_API="https://api.digitalocean.com/v2"
-      TOKEN="$${COURSEULTRA_DO_PROVISIONING_TOKEN:-}"
-      LABEL="${self.triggers.stack_name}-autoscaler"
-      TRIGGER="${self.triggers.stack_name}-autoscale-cron"
-
-      [ -n "$TOKEN" ] || {
-        echo "ERROR: use courseultra-terraform.sh so Functions cleanup receives a current provisioning token" >&2
-        exit 1
-      }
-
-      for COMMAND in curl jq base64; do
-        command -v "$COMMAND" >/dev/null 2>&1 || {
-          echo "ERROR: $COMMAND is required for Functions cleanup" >&2
-          exit 1
-        }
-      done
-
-      delete_allow_missing() {
-        AUTH_HEADER="$1"
-        URL="$2"
-        HTTP_CODE=$(curl -sS -o /dev/null -w '%%{http_code}' -X DELETE \
-          -H "$AUTH_HEADER" "$URL")
-        case "$HTTP_CODE" in
-          2??|404) return 0 ;;
-          *)
-            echo "ERROR: DELETE $URL returned HTTP $HTTP_CODE" >&2
-            return 1
-            ;;
-        esac
-      }
-
-      echo "=== Destroying autoscaler function ==="
-      echo "Looking for namespace with label: $LABEL"
-
-      NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
-      printf '%s' "$NS_LIST" | jq -e \
-        'has("namespaces")
-          and ((.namespaces == null)
-            or ((.namespaces | type) == "array"
-              and all(.namespaces[];
-                type == "object"
-                and (.label | type) == "string"
-                and (.namespace | type) == "string")))' >/dev/null || {
-        echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
-        exit 1
-      }
-      NS_ID=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
-        '[(.namespaces // [])[] | select(.label == $l)] | .[0].namespace // empty')
-
-      if [ -z "$NS_ID" ]; then
-        echo "No namespace found with label $LABEL — nothing to destroy."
-        exit 0
-      fi
-
-      echo "Found namespace: $NS_ID"
-      NS_DETAIL=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces/$NS_ID")
-      NS_UUID=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.uuid // empty')
-      API_HOST=$(printf '%s' "$NS_DETAIL" | jq -r '.namespace.api_host // empty')
-      API_KEY=$(printf '%s' "$NS_DETAIL"  | jq -r '.namespace.key // empty')
-
-      # Delete cron trigger
-      echo "Deleting trigger $TRIGGER ..."
-      delete_allow_missing "Authorization: Bearer $TOKEN" \
-        "$DO_API/functions/namespaces/$NS_ID/triggers/$TRIGGER"
-
-      # Delete action + package via OpenWhisk API
-      if [ -n "$API_HOST" ] && [ -n "$NS_UUID" ] && [ -n "$API_KEY" ]; then
-        OW_AUTH=$(printf '%s:%s' "$NS_UUID" "$API_KEY" | base64 | tr -d '\n')
-        echo "Deleting action autoscaler/check ..."
-        delete_allow_missing "Authorization: Basic $OW_AUTH" \
-          "$API_HOST/api/v1/namespaces/_/actions/autoscaler/check"
-        echo "Deleting package autoscaler ..."
-        delete_allow_missing "Authorization: Basic $OW_AUTH" \
-          "$API_HOST/api/v1/namespaces/_/packages/autoscaler"
-      else
-        echo "OpenWhisk credentials unavailable; namespace deletion will remove its contents"
-      fi
-
-      # Delete the namespace itself
-      echo "Deleting namespace $NS_ID ..."
-      delete_allow_missing "Authorization: Bearer $TOKEN" \
-        "$DO_API/functions/namespaces/$NS_ID"
-
-      ATTEMPT=1
-      while [ "$ATTEMPT" -le 30 ]; do
-        NS_LIST=$(curl -fsS -H "Authorization: Bearer $TOKEN" "$DO_API/functions/namespaces")
-        printf '%s' "$NS_LIST" | jq -e \
-          'has("namespaces")
-            and ((.namespaces == null)
-              or ((.namespaces | type) == "array"
-                and all(.namespaces[];
-                  type == "object"
-                  and (.label | type) == "string"
-                  and (.namespace | type) == "string")))' >/dev/null || {
-          echo "ERROR: DigitalOcean returned an invalid namespace inventory" >&2
-          exit 1
-        }
-        MATCHES=$(printf '%s' "$NS_LIST" | jq -r --arg l "$LABEL" \
-          '[(.namespaces // [])[] | select(.label == $l)] | length')
-        if [ "$MATCHES" -eq 0 ]; then
-          echo "Verified namespace removal: $LABEL"
-          echo "=== Autoscaler function destroyed ==="
-          exit 0
-        fi
-        sleep 2
-        ATTEMPT=$((ATTEMPT + 1))
-      done
-
-      echo "ERROR: Functions namespace $LABEL still exists after cleanup" >&2
-      exit 1
-    EOT
-  }
 
   depends_on = [
     null_resource.cleanup_media_nodes,
+    null_resource.autoscaler_lifecycle,
     digitalocean_droplet.openvidu_master_node,
     digitalocean_vpc.openvidu_vpc,
     digitalocean_tag.media_node_tag,
@@ -618,12 +654,98 @@ resource "digitalocean_spaces_key" "openvidu_space_key" {
 }
 
 locals {
+  # Omit only comments, standalone Python docstrings and blank lines from transport.
+  # Source stays readable; render tests compare executable ASTs, including Lua strings.
+  capacity_python_sources = { for name in ["report-fleet-readiness.py", "recorder_admission.py", "arm-approved-recorder.py", "arm-fresh-recorder.py", "settle-recordings.py", "recorder-storage-probe.py", "report-recording-locations.py", "recording-job-observation.py", "settle-recording-jobs.py", "recorder-capacity-footprint.py", "recorder-isolation.py", "preserve-recorder-ipc.py", "media_drain_guard.py", "prepare-fresh-recorder.py", "prepare-fresh-apt.py"] : name =>
+    replace(replace(replace(file("${path.module}/${name}"), "/(?m)^[ \\t]*#[^\\n]*\\n/", ""), "/(?ms)^[ \\t]*\"\"\"[^\"\\r\\n].*?\"\"\"[ \\t]*\\n/", ""), "/(?m)^[ \\t]*\\n/", "")
+  }
+  # Transport only: preserve the rendered startup scripts byte-for-byte, including
+  # their failure handling. Remove the private decoded script on normal exit.
+  user_data_master_transport = templatefile("${path.module}/user-data-transport.sh.tftpl", {
+    payload = base64gzip(local.user_data_master), checksum = sha256(local.user_data_master)
+  })
+  user_data_media_transport = templatefile("${path.module}/user-data-transport.sh.tftpl", {
+    payload = base64gzip(local.user_data_media), checksum = sha256(local.user_data_media)
+  })
+  capacity_authority_settings = var.capacityReservationsEnabled ? join("", [
+    # jsonencode emits one physical line; the quoted delimiter prevents shell
+    # expansion even for credential metacharacters. Avoid inner base64 so the
+    # checksum-protected outer gzip can compress repeated profile/settings keys.
+    "cat > /etc/courseultra-capacity-drain.json <<'COURSEULTRA_SETTINGS_EOF'\n${jsonencode({ url = var.capacityBackendUrl, token = var.capacityBackendToken, cloudToken = var.autoscalerToken, stackName = var.stackName, mediaTag = digitalocean_tag.media_node_tag.name, drainingTag = digitalocean_tag.draining_tag.name })}\nCOURSEULTRA_SETTINGS_EOF\nchmod 600 /etc/courseultra-capacity-drain.json\n",
+    # Bind deployment identity only after Terraform creates the VPC; callers cannot
+    # know its UUID in advance. Profile and recorder-policy approval remain supplied.
+    "cat > /etc/courseultra-capacity-fleet-profile.json <<'COURSEULTRA_SETTINGS_EOF'\n${jsonencode(merge(jsondecode(var.capacityFleetDescriptorJson), { vpcId = digitalocean_vpc.openvidu_vpc.id, region = var.region }))}\nCOURSEULTRA_SETTINGS_EOF\nchmod 600 /etc/courseultra-capacity-fleet-profile.json\n",
+  ]) : ""
+  capacity_drain_settings = var.capacityReservationsEnabled ? join("", [local.capacity_authority_settings,
+    join("", [for name in ["report-fleet-readiness.py", "recorder_admission.py", "arm-approved-recorder.py", "arm-fresh-recorder.py", "recorder-startup-guard.sh", "settle-recordings.py", "recorder-storage-probe.py"] : "cat > /usr/local/bin/${name} <<'COURSEULTRA_HELPER_EOF'\n${endswith(name, ".py") ? local.capacity_python_sources[name] : file("${path.module}/${name}")}COURSEULTRA_HELPER_EOF\nchmod 700 /usr/local/bin/${name}\n"])
+  ]) : ""
+  # Group related Python sources so outer gzip can reuse its bounded dictionary.
+  # Install every helper before the existing watcher starts; executable ASTs are checked.
+  capacity_media_drain_settings = var.capacityReservationsEnabled ? join("", [local.capacity_authority_settings,
+    join("", [for name in ["report-fleet-readiness.py", "arm-fresh-recorder.py", "arm-approved-recorder.py", "report-recording-locations.py", "recorder_admission.py", "recorder-capacity-footprint.py", "settle-recordings.py", "settle-recording-jobs.py", "recording-job-observation.py", "recorder-storage-probe.py", "recorder-isolation.py", "preserve-recorder-ipc.py", "recorder-startup-guard.sh"] : "cat > /usr/local/bin/${name} <<'COURSEULTRA_HELPER_EOF'\n${endswith(name, ".py") ? local.capacity_python_sources[name] : file("${path.module}/${name}")}COURSEULTRA_HELPER_EOF\nchmod 700 /usr/local/bin/${name}\n"]),
+    "cp /usr/local/bin/courseultra-media-drain-guard /usr/local/bin/media_drain_guard.py\nchmod 700 /usr/local/bin/media_drain_guard.py\n"
+  ]) : ""
+  capacity_master_drain_settings = var.capacityReservationsEnabled ? "${local.capacity_drain_settings}cat > /usr/local/bin/media_drain_guard.py <<'COURSEULTRA_HELPER_EOF'\n${var.capacityReservationsEnabled ? local.capacity_python_sources["media_drain_guard.py"] : file("${path.module}/media_drain_guard.py")}COURSEULTRA_HELPER_EOF\nchmod 700 /usr/local/bin/media_drain_guard.py\n" : ""
+  capacity_fleet_report          = var.capacityReservationsEnabled ? "timeout --kill-after=2s 20s python3 /usr/local/bin/report-fleet-readiness.py /etc/courseultra-capacity-drain.json || echo 'Fleet observation held; existing reservations retained'\n" : ""
+  # Two bounded observations per existing cron invocation leave freshness margin
+  # without extending evidence TTL or allowing overlapping watcher processes.
+  capacity_fleet_report_cycle     = var.capacityReservationsEnabled ? "fleet_tick_started=$SECONDS\n${local.capacity_fleet_report}fleet_tick_delay=$((30 - (SECONDS - fleet_tick_started)))\nif [ \"$fleet_tick_delay\" -gt 0 ]; then sleep \"$fleet_tick_delay\"; fi\n${local.capacity_fleet_report}" : ""
+  capacity_recording_report       = var.capacityReservationsEnabled ? "timeout --kill-after=5s 45s python3 /usr/local/bin/report-recording-locations.py /etc/courseultra-capacity-drain.json || echo 'Recording placement reporting held; recording ownership retained'\n" : ""
+  capacity_node_reports           = var.capacityReservationsEnabled ? "(${local.capacity_recording_report}) &\n${local.capacity_fleet_report_cycle}wait\n" : ""
+  capacity_watcher_lock           = var.capacityReservationsEnabled ? "exec 8>/var/lock/openvidu-tag-watcher.lock\nflock -n 8 || exit 0\n" : ""
+  capacity_fresh_arm              = var.capacityReservationsEnabled ? "python3 /usr/local/bin/arm-approved-recorder.py || { echo 'Approved recorder first-start held'; exit 1; }\n" : ""
+  capacity_fast_watcher_cron      = var.capacityReservationsEnabled ? "\necho '* * * * * root /usr/local/bin/tag_watcher.sh >> /var/log/tag_watcher.log 2>&1' > /etc/cron.d/tag-watcher\nchmod 644 /etc/cron.d/tag-watcher" : ""
+  capacity_master_watcher_install = var.capacityReservationsEnabled ? "${local.capacity_master_drain_settings}printf '%s' '${base64encode("#!/bin/bash\n${local.capacity_watcher_lock}${local.capacity_fleet_report_cycle}")}' | base64 --decode > /usr/local/bin/tag_watcher.sh\nchmod 700 /usr/local/bin/tag_watcher.sh${local.capacity_fast_watcher_cron}\n" : ""
+  # Default-disabled qualification-only barrier. Place before vendor service
+  # enablement on BOTH roles; a reboot cannot skip unarmed guard installation.
+  recorder_guard_barrier = (var.isolatedRecorderGuard ? <<-EOF
+if [ "${var.isolatedRecorderGuard}" = "true" ]; then
+  install -d -m 755 /etc/systemd/system/openvidu.service.d
+  printf '[Unit]\nConditionPathExists=/opt/openvidu/.courseultra-recorder-prepared\n' > /etc/systemd/system/openvidu.service.d/courseultra-recorder.conf
+  chmod 644 /etc/systemd/system/openvidu.service.d/courseultra-recorder.conf
+fi
+EOF
+  : "")
+
+  recorder_guard_prepare        = <<-EOF
+if [ "${var.isolatedRecorderGuard}" = "true" ]; then
+  cat > /usr/local/bin/prepare-fresh-recorder.py <<'COURSEULTRA_HELPER_EOF'
+${local.capacity_python_sources["prepare-fresh-recorder.py"]}COURSEULTRA_HELPER_EOF
+  cat > /usr/local/share/courseultra-recorder-start.sh <<'COURSEULTRA_HELPER_EOF'
+${file("${path.module}/recorder-startup-guard.sh")}COURSEULTRA_HELPER_EOF
+  printf '%s' '${filebase64("${path.module}/recorder-startup-guard.override.yaml")}' | base64 --decode > /usr/local/share/courseultra-recorder.override.yaml
+  chmod 600 /usr/local/bin/prepare-fresh-recorder.py /usr/local/share/courseultra-recorder-start.sh /usr/local/share/courseultra-recorder.override.yaml
+  python3 /usr/local/bin/prepare-fresh-recorder.py "$RECORDER_NODE_ROLE" || { echo "[OpenVidu] unarmed recorder preparation refused"; exit 1; }
+  install -m 600 /dev/null /opt/openvidu/.courseultra-recorder-prepared
+  systemctl daemon-reload
+fi
+EOF
+  recorder_guard_prepare_master = var.isolatedRecorderGuard ? "RECORDER_NODE_ROLE=master_node\n${local.recorder_guard_prepare}" : ""
+  recorder_guard_prepare_media  = var.isolatedRecorderGuard ? "RECORDER_NODE_ROLE=media_node\n${local.recorder_guard_prepare}" : ""
+  # One reviewed release contract for both roles. TODO(3.8 integration): update
+  # all three values together after reviewing the vendor installers and SDK;
+  # also qualify fresh-master Redis persistence, restore and drain readiness.
+  # A shared version edit alone must never select an unreviewed installer.
+  openvidu_installer_release = {
+    version       = "3.8.0"
+    master_sha256 = "feae2e1b9fff75edb3c087d7263ce58b553d5f51193046e9359fb0875856d7f2"
+    media_sha256  = "8d79aa04f303ef5ace2abda8233960480441591cb130fd48460770f071d41c71"
+  }
+
+  # Both fixed and autoscaled nodes share this exact fresh-node preparation.
+  # Keep signed APT metadata checks; switching the inconsistent mirror is not
+  # permission to ignore hash failures or replay installation on a running node.
+  fresh_apt_prepare = <<-EOF
+python3 - <<'COURSEULTRA_APT_EOF'
+${local.capacity_python_sources["prepare-fresh-apt.py"]}COURSEULTRA_APT_EOF
+EOF
+
   install_script_master = <<-EOF
 #!/bin/bash
 set -e
 umask 077
 
-OPENVIDU_VERSION=3.7.0
+OPENVIDU_VERSION=${local.openvidu_installer_release.version}
 DOMAIN=
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
 
@@ -687,11 +809,11 @@ MASTER_NODE_ID="$(/usr/local/bin/store_secret.sh save MASTER_NODE_ID "$MASTER_NO
 
 ALL_SECRETS_GENERATED="$(/usr/local/bin/store_secret.sh save ALL_SECRETS_GENERATED "true")"
 
-# Fetch the immutable 3.7.0 installer over TLS and verify the reviewed artifact
+# Fetch the release-pinned installer over TLS and verify the reviewed artifact
 # before running it as root. Update the checksum deliberately during upgrades.
 INSTALL_SCRIPT=/tmp/install_ov_master_node.sh
 INSTALL_SCRIPT_URL="https://s3-eu-west-1.amazonaws.com/get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_master_node.sh"
-INSTALL_SCRIPT_SHA256="fdaebc7a729110049dafbdd9de7bf8bcfe2a687c86f22c54d87c0601413cb9e8"
+INSTALL_SCRIPT_SHA256="${local.openvidu_installer_release.master_sha256}"
 curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$INSTALL_SCRIPT" | sha256sum --check --status || {
   echo "OpenVidu master installer checksum verification failed"
@@ -805,6 +927,27 @@ sed -i "s|EXTERNAL_S3_PATH_STYLE_ACCESS=.*|EXTERNAL_S3_PATH_STYLE_ACCESS=$EXTERN
 sed -i "s|EXTERNAL_S3_BUCKET_APP_DATA=.*|EXTERNAL_S3_BUCKET_APP_DATA=$EXTERNAL_S3_BUCKET_APP_DATA|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s|EXTERNAL_S3_ACCESS_KEY=.*|EXTERNAL_S3_ACCESS_KEY=$EXTERNAL_S3_ACCESS_KEY|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
 sed -i "s|EXTERNAL_S3_SECRET_KEY=.*|EXTERNAL_S3_SECRET_KEY=$EXTERNAL_S3_SECRET_KEY|" "$${CLUSTER_CONFIG_DIR}/openvidu.env"
+
+# Capacity readiness observes the actual recorder process. Publish this template
+# before media-node creation so every fresh autoscaled node inherits the listener.
+if [ "${var.capacityReservationsEnabled}" = "true" ]; then
+  EGRESS_TEMPLATE="$${CLUSTER_CONFIG_DIR}/media_node/egress.yaml"
+  test "$(grep -c '^health_port:' "$EGRESS_TEMPLATE")" = 1
+  if ! grep -q '^prometheus_port:' "$EGRESS_TEMPLATE"; then
+    sed -i '/^health_port:/a\
+prometheus_port: 9094
+' "$EGRESS_TEMPLATE"
+  fi
+  test "$(grep -c '^prometheus_port: 9094$' "$EGRESS_TEMPLATE")" = 1
+  # Exact3.8 exits IO drain when its first worker is idle. A single worker
+  # preserves queued terminal acknowledgements before recorder-only graceful exit.
+  if ! grep -q '^io_workers:' "$EGRESS_TEMPLATE"; then
+    sed -i '/^health_port:/a\
+io_workers: 1
+' "$EGRESS_TEMPLATE"
+  fi
+  test "$(grep -c '^io_workers: 1$' "$EGRESS_TEMPLATE")" = 1
+fi
 
 # OpenVidu's external S3 settings serve cluster data, but the v2 compatibility layer otherwise
 # keeps completed recordings on the master disk. CourseUltra migrates each provider recording to
@@ -1068,6 +1211,13 @@ EOF
 #!/bin/bash
 set -e
 
+# The installer writes 1 before configuration and Redis persistence are ready.
+# A partial installation must never bypass those steps through reboot/retry.
+if [ "$(cat /usr/local/bin/openvidu_install_counter.txt 2>/dev/null)" != "installation_complete" ]; then
+  echo "[OpenVidu] installation incomplete; inspect bootstrap failure before restarting" >&2
+  exit 1
+fi
+
 # Stop all services
 systemctl stop openvidu
 
@@ -1087,6 +1237,8 @@ import time
 import traceback
 import urllib.request
 import urllib.error
+import urllib.parse
+import uuid
 
 # ---- Configuration (values baked via Terraform interpolation) ----
 DO_TOKEN      = "${var.autoscalerToken}"
@@ -1100,7 +1252,12 @@ STACK_NAME    = "${var.stackName}"
 MIN_NODES     = int("${var.minNumberOfMediaNodes}")
 MAX_NODES     = int("${var.maxNumberOfMediaNodes}")
 TARGET_CPU    = float("${var.scaleTargetCPU}")
-USER_DATA     = base64.b64decode("${base64encode(local.user_data_media)}").decode()
+SCALE_IN_ENABLED = "${var.automaticScaleInEnabled}" == "true"
+CAPACITY_ENABLED = "${var.capacityReservationsEnabled}" == "true"
+CAPACITY_PROFILE_FINGERPRINT = "${var.capacityProfileFingerprint}"
+CAPACITY_BACKEND_URL = base64.b64decode("${base64encode(var.capacityBackendUrl)}").decode().rstrip("/")
+CAPACITY_BACKEND_TOKEN = base64.b64decode("${base64encode(var.capacityBackendToken)}").decode()
+USER_DATA     = base64.b64decode("${base64encode(local.user_data_media_transport)}").decode()
 
 EXPECTED_CPU_MODES = frozenset({
     "idle", "iowait", "irq", "nice", "softirq", "steal", "system", "user",
@@ -1115,6 +1272,10 @@ HDR = {"Authorization": f"Bearer {DO_TOKEN}", "Content-Type": "application/json"
 # All log lines are collected here and returned in the response body so they
 # are visible in the DigitalOcean Functions console (activation result).
 _LOGS = []
+_DEADLINE = None
+
+def time_left(reserve=0):
+    return max(0.0, _DEADLINE - time.monotonic() - reserve) if _DEADLINE is not None else float("inf")
 
 def log(m):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}] {m}"
@@ -1134,38 +1295,58 @@ def apicall(method, path, body=None):
         if "user_data" in logged_body:
             logged_body["user_data"] = "[redacted]"
         log(f"     body: {json.dumps(logged_body)}")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            d = r.read().decode()
-            parsed = json.loads(d) if d.strip() else {}
-            log(f"     <- {r.status} OK")
-            return parsed
-    except urllib.error.HTTPError as e:
-        body_txt = e.read().decode()[:400]
-        if isinstance(body, dict) and "user_data" in body:
-            body_txt = "[response redacted for media-node creation]"
-        log(f"     <- HTTP {e.code} ERROR: {body_txt}")
-        return None
-    except urllib.error.URLError as e:
-        log(f"     <- URL error: {e.reason}")
-        return None
-    except Exception as e:
-        log(f"     <- unexpected error: {e}")
-        log(traceback.format_exc())
-        return None
+    # Only provider reads are replayable. Reserve outcome/alert time within the
+    # Function's 120s limit; a timed-out create/tag/delete is never dispatched twice.
+    retry_read = method == "GET" and url.startswith(API + "/")
+    read_deadline = time.monotonic() + min(12, time_left(20))
+    for attempt in range(3 if retry_read else 1):
+        timeout = min(4, read_deadline - time.monotonic()) if retry_read else min(60, time_left(20))
+        if timeout <= 0:
+            log("     <- activation read/mutation budget exhausted; holding")
+            return None
+        retryable = False
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = r.read().decode()
+                parsed = json.loads(d) if d.strip() else {}
+                log(f"     <- {r.status} OK")
+                return parsed
+        except urllib.error.HTTPError as e:
+            # Status is sufficient for retries; do not spend the remaining read
+            # budget fetching an error body (which may also echo cloud-init secrets).
+            e.close()
+            log(f"     <- HTTP {e.code} ERROR")
+            retryable = e.code == 429 or 500 <= e.code <= 599
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)
+            log(f"     <- URL error: {reason}")
+            retryable = isinstance(reason, TimeoutError)
+        except Exception as e:
+            log(f"     <- unexpected error: {e}")
+            log(traceback.format_exc())
+            return None
+        if not retry_read or not retryable or attempt == 2:
+            return None
+        delay = random.uniform(0.2, 0.6) * (2 ** attempt)
+        if time.monotonic() + delay + 1 > read_deadline:
+            return None
+        log("     Retrying transient DigitalOcean read")
+        time.sleep(delay)
 
-def list_nodes():
+def list_nodes(tag=MEDIA_TAG):
     log("Listing media nodes ...")
-    r = apicall("GET", f"/droplets?tag_name={MEDIA_TAG}&per_page=200")
-    if r is None:
-        raise RuntimeError("DigitalOcean did not return the media-node inventory")
+    r = apicall("GET", f"/droplets?tag_name={tag}&per_page=200")
+    if not isinstance(r, dict):
+        raise ReadinessUnavailable("DigitalOcean did not return the media-node inventory")
     nodes = r.get("droplets")
     if not isinstance(nodes, list):
-        raise RuntimeError("DigitalOcean returned an invalid media-node inventory")
+        raise ReadinessUnavailable("DigitalOcean returned an invalid media-node inventory")
+    if r.get("links", {}).get("pages", {}).get("next"):
+        raise ReadinessUnavailable("Incomplete paginated media-node inventory; holding allocation")
     for d in nodes:
         tags = d.get("tags") if isinstance(d, dict) else None
         if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
-            raise RuntimeError("DigitalOcean returned invalid media-node tag metadata")
+            raise ReadinessUnavailable("DigitalOcean returned invalid media-node tag metadata")
         log(f"  droplet id={d['id']} name={d['name']} status={d['status']} "
             f"region={d.get('region',{}).get('slug','?')} created={d.get('created_at','?')}")
     return nodes
@@ -1195,7 +1376,7 @@ def cpu(did, name):
     now = int(time.time())
     log(f"  Fetching CPU metrics for droplet {did} ({name}) ...")
     r = apicall("GET", f"/monitoring/metrics/droplet/cpu?host_id={did}&start={now - 240}&end={now}")
-    if r is None:
+    if not isinstance(r, dict) or not isinstance(r.get("data"), dict):
         log(f"    CPU metrics request failed for {did}")
         return None
     results = r.get("data", {}).get("result")
@@ -1233,8 +1414,10 @@ def cpu(did, name):
     log(f"    CPU usage for {did} ({name}): {usage}%")
     return usage
 
-def create_node():
-    name = f"{STACK_NAME}-media-{int(time.time())}-{random.randint(1000,9999)}"
+def create_node(name=None, return_receipt=False):
+    if len(USER_DATA.encode("utf-8")) > 65536:
+        raise RuntimeError("Media startup payload exceeds the 64 KiB user_data limit")
+    name = name or f"{STACK_NAME}-media-{int(time.time())}-{random.randint(1000,9999)}"
     log(f"Creating new media node: name={name} region={REGION} size={SIZE} vpc={VPC_UUID}")
     try:
         keys = [int(SSH_KEY_ID)]
@@ -1243,14 +1426,14 @@ def create_node():
     payload = {
         "name": name, "region": REGION, "size": SIZE,
         "image": "ubuntu-24-04-x64", "vpc_uuid": VPC_UUID,
-        "ssh_keys": keys, "tags": [MEDIA_TAG],
+        "ssh_keys": keys, "tags": [MEDIA_TAG, STACK_NAME] if CAPACITY_ENABLED else [MEDIA_TAG],
         "user_data": USER_DATA, "monitoring": True,
     }
     r = apicall("POST", "/droplets", payload)
     if r and "droplet" in r:
         d = r["droplet"]
         log(f"  Node created: id={d['id']} name={d['name']} status={d['status']}")
-        return True
+        return d if return_receipt else True
     log(f"  Failed to create node {name}")
     return False
 
@@ -1271,14 +1454,195 @@ def untag_res(did, t):
     ) is not None
 
 def finish(result):
+    if CAPACITY_ENABLED:
+        codes = {alert["code"] for alert in result.get("alerts", [])}
+        provisioning_failed = result.get("error") or result.get("warning", "").startswith("Provision outcome unknown")
+        if result.get("readiness_wait"):
+            codes.add("READINESS_UNAVAILABLE")
+        elif result.get("readiness_verified") and not provisioning_failed:
+            codes.add("READINESS_RECOVERED")
+        if provisioning_failed:
+            codes.add("PROVISIONING_FAILED")
+        if result.get("waiting_for_capacity"):
+            codes.add("CAPACITY_WAITING")
+        # Preserve the urgent family signal before quota/waiting notices can
+        # consume the bounded finish budget, especially for an unknown create.
+        for code in sorted(codes, key=lambda code: (code not in (
+                "PROVISIONING_FAILED", "READINESS_UNAVAILABLE", "READINESS_RECOVERED"), code)):
+            try:
+                capacity_request("alert", {"stack": STACK_NAME, "code": code})
+            except Exception:
+                # Delivery failure is visible and retried next activation, but must not
+                # repeat a cloud create or lose a durable provisioning outcome.
+                result.setdefault("alert_delivery_failed", []).append(code)
     log("=" * 60)
     result["logs"] = list(_LOGS)
     return {"body": result}
+
+class ReadinessUnavailable(RuntimeError):
+    """Known pre-dispatch readiness hold, not a cloud creation failure."""
+
+class NoCapacityRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Capacity authority redirects are forbidden")
+
+def capacity_request(path, payload):
+    parsed = urllib.parse.urlparse(CAPACITY_BACKEND_URL)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment
+            or not CAPACITY_BACKEND_TOKEN or not CAPACITY_PROFILE_FINGERPRINT):
+        raise RuntimeError("Capacity authority is not configured")
+    request = urllib.request.Request(
+        CAPACITY_BACKEND_URL + "/webhooks/openvidu/capacity/" + path,
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"X-Capacity-Token": CAPACITY_BACKEND_TOKEN, "Content-Type": "application/json"})
+    # Never follow a redirect with the dedicated credential, or log the response body on errors.
+    try:
+        timeout = min(10, time_left())
+        if timeout <= 0:
+            raise RuntimeError("Capacity request budget exhausted; retain outstanding intent")
+        with urllib.request.build_opener(NoCapacityRedirects()).open(request, timeout=timeout) as response:
+            body = response.read(65537)
+            if len(body) > 65536:
+                raise RuntimeError("Capacity response exceeds limit")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as error:
+        # Only the authority's explicit pre-dispatch 503 is a readiness wait.
+        # A timeout, invalid response, or failed outcome receipt stays an error:
+        # do not hide an unknown mutation or permit a second cloud creation.
+        error.close()
+        if error.code == 503 and path in ("claim", "claim-drain"):
+            raise ReadinessUnavailable("Capacity readiness unavailable; allocation held") from None
+        raise RuntimeError("Capacity authority unavailable; retain outstanding intent") from None
+    except Exception:
+        raise RuntimeError("Capacity authority unavailable; retain outstanding intent") from None
+
+def account_fleet_limit(allocated, result):
+    if MAX_NODES != 0:
+        return MAX_NODES
+    account = apicall("GET", "/account")
+    account_details = account.get("account") if isinstance(account, dict) else None
+    quota = account_details.get("droplet_limit") if isinstance(account_details, dict) else None
+    if type(quota) is not int or quota < 1:
+        raise ReadinessUnavailable("Complete DigitalOcean account quota evidence required")
+    inventory = apicall("GET", "/droplets?per_page=1")
+    inventory_meta = inventory.get("meta") if isinstance(inventory, dict) else None
+    total = inventory_meta.get("total") if isinstance(inventory_meta, dict) else None
+    # Account-wide usage includes other stacks and draining Droplets. Never
+    # interpret a failed quota lookup as unlimited permission to create machines.
+    if type(total) is not int or total < allocated:
+        raise ReadinessUnavailable("Complete DigitalOcean account quota evidence required")
+    maximum = allocated + max(0, quota - total)
+    result["account_quota"] = quota
+    result["account_droplets"] = total
+    result["effective_media_limit"] = maximum
+    if total * 5 >= quota * 4:
+        result.setdefault("alerts", []).append({"code": "ACCOUNT_DROPLET_QUOTA_PRESSURE", "used": total, "limit": quota})
+        log(f"ALERT: account Droplet quota usage {total}/{quota}")
+    return maximum
+
+def reconcile_capacity(allocated, inventory, result, maximum=None):
+    maximum = MAX_NODES if maximum is None else maximum
+    # Do not consume a durable dispatch grant when insufficient time remains for
+    # its one cloud attempt, outcome receipt and alert. This is still pre-dispatch.
+    if time_left() < 40:
+        raise ReadinessUnavailable("Capacity activation budget low; allocation held")
+    if maximum < 1:
+        result["waiting_for_capacity"] = True
+        result["warning"] = "DigitalOcean account quota has no media-node headroom"
+        return finish(result)
+    # The backend commits one dispatch grant before returning it. All replays and overlapping
+    # activations receive observation-only claims. An unknown create never expires into a retry.
+    claim = capacity_request("claim", {
+        "profileFingerprint": CAPACITY_PROFILE_FINGERPRINT,
+        "nodeType": SIZE,
+        "stack": STACK_NAME, "allocatedDropletIds": sorted(str(node["id"]) for node in inventory),
+        "maximum": maximum,
+        **quota_claim_fields(result),
+    })
+    if not isinstance(claim, dict) or type(claim.get("createAllowed")) is not bool or claim.get("nodeType") != SIZE:
+        raise RuntimeError("Invalid capacity claim")
+    result["readiness_verified"] = True
+    result["waiting_for_capacity"] = claim.get("waitingForCapacity") is True
+    intent = claim.get("intentId")
+    name = claim.get("nodeName")
+    if intent is None and claim["createAllowed"] is False:
+        return reconcile_capacity_drain(inventory, result, maximum)
+    try:
+        if str(uuid.UUID(intent)) != intent or name != f"{STACK_NAME}-capacity-{intent}":
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise RuntimeError("Invalid provision intent identity")
+    matches = [node for node in inventory if node.get("name") == name]
+    if len(matches) > 1:
+        raise RuntimeError("Duplicate provision outcome; manual reconciliation required")
+    receipt = matches[0] if matches else None
+    if claim["createAllowed"] and receipt is None:
+        if allocated >= maximum:
+            raise RuntimeError("Allocation limit reached; retain claim for reconciliation")
+        receipt = create_node(name, return_receipt=True)
+        result["action"] = "scale-out-capacity" if receipt else "hold"
+    if receipt:
+        if (not isinstance(receipt, dict) or not str(receipt.get("id", "")).isdigit()
+                or receipt.get("name") != name or receipt.get("size_slug") != SIZE):
+            raise RuntimeError("Unverified creation receipt; retain intent")
+        capacity_request("observed", {"intentId": intent, "dropletId": str(receipt["id"])})
+        result["intent_id"] = intent
+    else:
+        result["warning"] = "Provision outcome unknown; retained intent requires reconciliation"
+    return finish(result)
+
+def quota_claim_fields(result):
+    if MAX_NODES != 0:
+        return {}
+    return {"accountDropletQuota": result["account_quota"],
+            "accountDropletCount": result["account_droplets"]}
+
+def reconcile_capacity_drain(inventory, result, maximum=None):
+    maximum = MAX_NODES if maximum is None else maximum
+    if not SCALE_IN_ENABLED:
+        result["warning"] = "Capacity mode holds automatic scale-in: switch disabled"
+        return finish(result)
+    # The authority excludes the exact incarnation atomically with reservation checks.
+    # This is permission to BEGIN graceful drain, never permission to delete the VM.
+    receipt = capacity_request("claim-drain", {
+        "profileFingerprint": CAPACITY_PROFILE_FINGERPRINT, "nodeType": SIZE,
+        "stack": STACK_NAME, "allocatedDropletIds": sorted(str(node["id"]) for node in inventory),
+        "minimum": MIN_NODES, "maximum": maximum,
+        **quota_claim_fields(result),
+    })
+    if receipt == {}:
+        result["warning"] = "No idle capacity drain authorized"
+        return finish(result)
+    if (not isinstance(receipt, dict) or receipt.get("applicationExcluded") is not True
+            or receipt.get("applicationObligationsClear") is not False
+            or not isinstance(receipt.get("nodeId"), str) or not receipt["nodeId"]
+            or not isinstance(receipt.get("generation"), str) or not receipt["generation"]
+            or not isinstance(receipt.get("dropletId"), str)):
+        raise RuntimeError("Invalid capacity drain receipt")
+    matches = [node for node in inventory if str(node["id"]) == receipt["dropletId"]]
+    if (len(matches) != 1 or matches[0].get("size_slug") != SIZE
+            or matches[0].get("region", {}).get("slug") != REGION
+            or matches[0].get("vpc_uuid") != VPC_UUID
+            or matches[0].get("status") != "active"):
+        raise RuntimeError("Capacity drain target is outside current fleet")
+    target = matches[0]
+    # A failed tag delivery retains backend exclusion. The next invocation retries
+    # this same node; it must not undo the exclusion or choose a replacement target.
+    if DRAINING_TAG not in target["tags"] and not tag_res(target["id"], DRAINING_TAG):
+        raise RuntimeError("Capacity drain tag unconfirmed; application exclusion retained")
+    result["action"] = "scale-in-capacity"
+    result["drained_node"] = {"id": target["id"], "name": target["name"]}
+    if MEDIA_TAG in target["tags"] and not untag_res(target["id"], MEDIA_TAG):
+        result["warning"] = "Drain delivered; active tag removal unconfirmed"
+    return finish(result)
 
 def main(args):
     """DO Functions entry point — invoked every 4 minutes by scheduled trigger."""
     # Function containers are reused. Keep each activation response bounded to
     # this invocation instead of accumulating diagnostics from earlier runs.
+    global _DEADLINE
+    _DEADLINE = time.monotonic() + 115
     _LOGS.clear()
     log("=" * 60)
     log(f"Autoscaler invoked | stack={STACK_NAME} region={REGION}")
@@ -1293,23 +1657,46 @@ def main(args):
         "avg_cpu": None,
     }
 
+    if isinstance(args, dict) and "capacity" in args:
+        result["error"] = "Push capacity floors are unsupported; use the authoritative claim workflow"
+        return finish(result)
+
     try:
         tagged_nodes = list_nodes()
         # A failed active-tag removal can leave a node with both lifecycle tags while its
         # on-node watcher is already draining it. It is no longer usable capacity and must
         # never mask the configured floor or become a scale-in candidate on the next run.
-        draining_nodes = [d for d in tagged_nodes if DRAINING_TAG in d["tags"]]
-        nodes = [d for d in tagged_nodes if DRAINING_TAG not in d["tags"]]
+        # Include draining-only VMs: their active tag may already be removed,
+        # but readiness/finalization can legitimately defer deletion. Ignoring
+        # these machines would permit unlimited replacement provisioning.
+        drain_inventory = list_nodes(DRAINING_TAG)
+        draining_by_id = {d['id']: d for d in tagged_nodes + drain_inventory
+                          if DRAINING_TAG in d['tags']}
+        draining_nodes = list(draining_by_id.values())
+        nodes = [d for d in tagged_nodes if d['id'] not in draining_by_id]
         n = len(nodes)
+        allocated = len({d['id'] for d in tagged_nodes + drain_inventory})
+        result['allocated_nodes'] = allocated
         result["nodes"] = n
         result["draining_nodes"] = len(draining_nodes)
         log(
-            f"Usable media nodes: {n}; "
-            f"draining nodes still carrying active tag: {len(draining_nodes)}"
+            f"Non-draining VMs (not a readiness measurement): {n}; "
+            f"draining VMs: {len(draining_nodes)}; allocated VMs: {allocated}"
         )
 
-        # Ensure minimum
+        if CAPACITY_ENABLED:
+            # Includes minimum recovery: capacity mode never bypasses durable claims using CPU
+            # or MIN_NODES, and never selects a reserved node for automatic scale-in.
+            maximum = account_fleet_limit(allocated, result)
+            return reconcile_capacity(allocated, list({d['id']: d for d in tagged_nodes + drain_inventory}.values()), result, maximum)
+
+        if MAX_NODES == 0:
+            raise RuntimeError("Account-quota scaling requires authoritative capacity mode")
+
         if n < MIN_NODES:
+            if allocated >= MAX_NODES:
+                result['error'] = 'Ready-capacity recovery is waiting for the allocated-node limit'
+                return finish(result)
             log(f"DECISION: scale-out-min (have {n}, need {MIN_NODES})")
             created = create_node()
             result["action"] = "scale-out-min" if created else "hold"
@@ -1333,9 +1720,7 @@ def main(args):
             # Missing metrics commonly means a node is still booting or the
             # monitoring API is degraded. Neither state is evidence to add or
             # remove capacity, so wait for a complete sample on the next run.
-            result["error"] = f"CPU metrics available for only {len(cmap)}/{n} media nodes"
-            log(f"DECISION: hold ({result['error']})")
-            return finish(result)
+            raise ReadinessUnavailable(f"CPU metrics available for only {len(cmap)}/{n} media nodes")
 
         avg = sum(v for v, _ in cmap.values()) / len(cmap)
         result["avg_cpu"] = round(avg, 2)
@@ -1344,8 +1729,8 @@ def main(args):
             log(f"  {did} ({name}): {usage}%")
 
         # Scale out
-        if avg > TARGET_CPU and n < MAX_NODES:
-            log(f"DECISION: scale-out (avg={avg:.2f}% > target={TARGET_CPU}%, nodes={n} < max={MAX_NODES})")
+        if avg > TARGET_CPU and allocated < MAX_NODES:
+            log(f"DECISION: scale-out (avg={avg:.2f}% > target={TARGET_CPU}%, allocated={allocated} < max={MAX_NODES})")
             created = create_node()
             result["action"] = "scale-out" if created else "hold"
             result["created"] = created
@@ -1353,8 +1738,16 @@ def main(args):
                 result["error"] = "DigitalOcean did not confirm media-node creation"
             return finish(result)
 
-        if avg > TARGET_CPU and n >= MAX_NODES:
+        if avg > TARGET_CPU and allocated >= MAX_NODES:
             log(f"DECISION: hold (avg={avg:.2f}% > target but already at max={MAX_NODES})")
+
+        # Scale-out remains usable while recording-safe scale-in is qualified.
+        # Lowering MAX_NODES is not authority to remove an occupied server either.
+        # This switch prevents new automatic drains; it does not cancel a drain
+        # already accepted by the provider or stop an existing on-node watcher.
+        if not SCALE_IN_ENABLED:
+            result["warning"] = "Automatic scale-in disabled; existing drains require explicit reconciliation"
+            return finish(result)
 
         # Scale in
         # Keep a dead band between scale-out and scale-in so a cluster near the
@@ -1366,7 +1759,7 @@ def main(args):
         if do_in and draining_nodes:
             draining_ids = sorted(str(node["id"]) for node in draining_nodes)
             result["warning"] = (
-                "Scale-in deferred while nodes remain both active-tagged and draining: "
+                "Scale-in deferred while nodes remain draining: "
                 + ", ".join(draining_ids)
             )
             log(f"DECISION: hold ({result['warning']})")
@@ -1394,6 +1787,10 @@ def main(args):
         else:
             log(f"DECISION: hold (avg={avg:.2f}% within range, nodes={n} within min/max)")
 
+    except ReadinessUnavailable as e:
+        result["readiness_wait"] = True
+        result["warning"] = str(e)
+        log("DECISION: hold until fresh capacity evidence is available")
     except Exception as e:
         log(f"UNHANDLED EXCEPTION: {e}")
         log(traceback.format_exc())
@@ -1405,14 +1802,14 @@ PYEOF
   tag_watcher_script_media = <<-EOF
 #!/bin/bash
 DRAINING_TAG="${digitalocean_tag.draining_tag.name}"
-SELF_TAGS=$(curl -sf http://169.254.169.254/metadata/v1/tags 2>/dev/null || echo "")
+${local.capacity_watcher_lock}${local.capacity_node_reports}SELF_TAGS=$(curl -sf ${var.capacityReservationsEnabled ? "--connect-timeout 2 --max-time 3 " : ""}http://169.254.169.254/metadata/v1/tags 2>/dev/null || echo "")
 
 if echo "$SELF_TAGS" | grep -qw "$DRAINING_TAG"; then
   echo "$(date): Draining tag detected. Initiating graceful shutdown."
   # Keep the cron entry until deletion succeeds. flock prevents concurrent
   # drains while allowing a later cron run to retry a failed self-delete.
   nohup flock -n /var/lock/openvidu-media-drain.lock \
-    /usr/local/bin/graceful_shutdown.sh >> /var/log/graceful_shutdown.log 2>&1 &
+    /usr/local/bin/graceful_shutdown.sh >> /var/log/graceful_shutdown.log 2>&1${var.capacityReservationsEnabled ? " 8>&-" : ""} &
 fi
 EOF
 
@@ -1481,7 +1878,7 @@ CONFIG_S3_EOF
   chmod 700 /usr/local/bin/config_s3.sh
 
   echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
-  apt-get update && apt-get install -y \
+  ${local.fresh_apt_prepare}apt-get --no-download install -y \
   curl \
   unzip \
   jq \
@@ -1546,13 +1943,28 @@ CONFIG_S3_EOF
   export AWS_SECRET_ACCESS_KEY="${digitalocean_spaces_key.openvidu_space_key.secret_key}"
   export AWS_DEFAULT_REGION="${var.spaceRegion}"
   
-  # Install OpenVidu
+  # The vendor enables systemd during installation. A reboot before Redis
+  # preparation must not start an unprotected datastore via that separate path.
+  # Install this before the vendor can enable its unit; it also covers retries.
+  install -d -m 755 /etc/systemd/system/openvidu.service.d
+  printf '[Unit]\nConditionPathExists=/opt/openvidu/.courseultra-redis-prepared\n' > /etc/systemd/system/openvidu.service.d/courseultra-redis.conf
+  chmod 644 /etc/systemd/system/openvidu.service.d/courseultra-redis.conf
+
+  ${local.recorder_guard_barrier}# Install OpenVidu
   /usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu"; exit 1; }
   
   # Config S3 bucket
   /usr/local/bin/config_s3.sh || { echo "[OpenVidu] error configuring S3 bucket"; exit 1; }
 
   # Start OpenVidu
+  # Fresh initialization only: existing containers/data require the separately
+  # reviewed migration. Never mount an empty directory over recording history.
+  printf '%s' '${filebase64("${path.module}/prepare-fresh-redis.py")}' | base64 --decode > /usr/local/bin/prepare-fresh-redis.py
+  printf '%s' '${filebase64("${path.module}/redis-durability.override.yaml")}' | base64 --decode > /usr/local/share/courseultra-redis.override.yaml
+  chmod 600 /usr/local/bin/prepare-fresh-redis.py /usr/local/share/courseultra-redis.override.yaml
+  python3 /usr/local/bin/prepare-fresh-redis.py || { echo "[OpenVidu] fresh Redis setup refused"; exit 1; }
+  install -m 600 /dev/null /opt/openvidu/.courseultra-redis-prepared
+  ${local.recorder_guard_prepare_master}systemctl daemon-reload
   systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1; }
 
   # Update shared secrets
@@ -1565,7 +1977,7 @@ CONFIG_S3_EOF
   echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
 fi
 
-# Wait for the app
+${local.capacity_master_watcher_install}# Wait for the app
 /usr/local/bin/check_app_ready.sh
 EOF
 
@@ -1638,15 +2050,32 @@ OPENVIDU_PRO_LICENSE=$(grep '^OPENVIDU_PRO_LICENSE=' /opt/openvidu/secrets.env |
 
 # Match the master bootstrap's transport and integrity guarantees. A changed
 # upstream artifact must be reviewed and repinned rather than executed silently.
+if [ "$OPENVIDU_VERSION" != "${local.openvidu_installer_release.version}" ]; then
+  echo "OpenVidu shared version does not match the reviewed installer release; update and review deployment code before provisioning media nodes" >&2
+  exit 1
+fi
 INSTALL_SCRIPT=/tmp/install_ov_media_node.sh
 INSTALL_SCRIPT_URL="https://s3-eu-west-1.amazonaws.com/get.openvidu.io/pro/elastic/$OPENVIDU_VERSION/install_ov_media_node.sh"
-INSTALL_SCRIPT_SHA256="69c15c9ab72de6cb9c49dfecb547be952deacd35dfcd22cc4e26c162693da28b"
+INSTALL_SCRIPT_SHA256="${local.openvidu_installer_release.media_sha256}"
 curl -fsSL "$INSTALL_SCRIPT_URL" -o "$INSTALL_SCRIPT"
 printf '%s  %s\n' "$INSTALL_SCRIPT_SHA256" "$INSTALL_SCRIPT" | sha256sum --check --status || {
   echo "OpenVidu media installer checksum verification failed"
   exit 1
 }
 INSTALL_COMMAND="sh $INSTALL_SCRIPT"
+
+# The pinned installer preserves this standard Compose override. Install it
+# before the first service start so newly scaled nodes never expose the low
+# inherited mediasoup socket limit. Do not overwrite an operator's override.
+NOFILE_OVERRIDE=/opt/openvidu/docker-compose.override.yaml
+NOFILE_EXPECTED=$(mktemp)
+printf '%s' '${filebase64("${path.module}/media-nofile.override.yaml")}' | base64 --decode > "$NOFILE_EXPECTED"
+if [ -e "$NOFILE_OVERRIDE" ] && ! cmp -s "$NOFILE_EXPECTED" "$NOFILE_OVERRIDE"; then
+  echo "Unexpected Compose override; refusing to replace operator configuration"
+  exit 1
+fi
+install -m 644 "$NOFILE_EXPECTED" "$NOFILE_OVERRIDE"
+rm -f "$NOFILE_EXPECTED"
 
 # Media node arguments
 COMMON_ARGS=(
@@ -1681,7 +2110,24 @@ EOF
 
   graceful_shutdown_script_media = <<-EOF
 #!/bin/bash
-set -e
+set -euo pipefail
+
+verify_ready_floor() {
+  /usr/local/bin/courseultra-media-drain-guard \
+    --master-id '${digitalocean_droplet.openvidu_master_node.id}' \
+    --master-ip '${digitalocean_droplet.openvidu_master_node.ipv4_address_private}' \
+    --vpc '${digitalocean_vpc.openvidu_vpc.id}' \
+    --minimum '${var.minNumberOfMediaNodes}' \
+    --active-tag '${digitalocean_tag.media_node_tag.name}' \
+    --draining-tag '${digitalocean_tag.draining_tag.name}' ${var.capacityReservationsEnabled ? "--capacity-settings /etc/courseultra-capacity-drain.json " : ""}"$@"
+}
+
+# A lifecycle tag requests drain; it does not prove replacement readiness.
+# Reserve spare ready capacity atomically before any service receives SIGQUIT.
+verify_ready_floor --require-idle-media --fence-restarts
+# Restart exclusion can take time; recheck serving peers before signaling work.
+verify_ready_floor --verify-restart-fence
+command -v docker >/dev/null || { echo "Docker state unavailable; holding drain"; exit 1; }
 
 echo "Starting graceful shutdown of OpenVidu Media Node..."
 
@@ -1689,20 +2135,20 @@ echo "Starting graceful shutdown of OpenVidu Media Node..."
 if [ -x "$(command -v docker)" ]; then
 
   echo "Stopping media node services and waiting for termination..."
-  docker container kill --signal=SIGQUIT openvidu || true
-  docker container kill --signal=SIGQUIT ingress || true
-  docker container kill --signal=SIGQUIT egress || true
-  for agent_container in $(docker ps --filter "label=openvidu-agent=true" --format '{{.Names}}'); do
-    docker container kill --signal=SIGQUIT "$agent_container"
-  done
+  # A second signal can force a busy media server to exit. The guard persists
+  # one request per exact container/process; watcher retries only observe it.
+  verify_ready_floor --signal-graceful
 
   # Bound one watcher attempt without treating elapsed time as permission to
   # delete a node that still owns live media. The cron watcher retries later.
   DRAIN_DEADLINE=$(( $(date +%s) + 600 ))
-  while [ $(docker ps --filter "label=openvidu-agent=true" -q | wc -l) -gt 0 ] || \
-        [ $(docker inspect -f '{{.State.Running}}' openvidu 2>/dev/null) == "true" ] || \
-        [ $(docker inspect -f '{{.State.Running}}' ingress 2>/dev/null) == "true" ] || \
-        [ $(docker inspect -f '{{.State.Running}}' egress 2>/dev/null) == "true" ]; do
+  while true; do
+    RUNNING_CONTAINERS=$(docker ps --format '{{.Names}}')
+    AGENT_CONTAINERS=$(docker ps --filter "label=openvidu-agent=true" -q)
+    if [ -z "$AGENT_CONTAINERS" ] && \
+       ! printf '%s\n' "$RUNNING_CONTAINERS" | grep -Eq '^(openvidu|ingress|egress)$'; then
+      break
+    fi
     if [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ]; then
       echo "Media is still active after 10 minutes; leaving the node draining for a later retry"
       exit 1
@@ -1711,6 +2157,25 @@ if [ -x "$(command -v docker)" ]; then
     sleep 10
   done
 fi
+
+# An absent running process is not proof of graceful completion: an OOM kill,
+# failed container or missing container can leave recording output unfinished.
+# Preserve the VM for recovery in those cases. Clean exit is necessary, not a
+# substitute for provider recording-finalization verification.
+AGENT_CONTAINERS=$(docker ps -a --filter "label=openvidu-agent=true" --format '{{.Names}}')
+for media_container in openvidu ingress egress $AGENT_CONTAINERS; do
+  EXIT_STATE=$(docker inspect --format '{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}' "$media_container")
+  if [ "$EXIT_STATE" != "exited 0 false" ]; then
+    echo "Drain held: $media_container did not exit cleanly; preserve the node for recovery"
+    exit 1
+  fi
+done
+
+# A long class may have outlived the replacement checked at drain start.
+# Clean exits alone do not prove uploaded output or empty recovery storage.
+# This additional veto preserves retained artifacts; it is not a substitute for
+# provider finalization/idle-only admission fencing before enabling scale-in.
+verify_ready_floor --verify-recording-storage --verify-restart-fence
 
 # Self-delete using doctl
 
@@ -1723,6 +2188,8 @@ doctl compute droplet delete "$DROPLET_ID" --force
 echo "Graceful shutdown completed."
 EOF
 
+  # Capacity transport omits comments and blank lines from pure shell script bodies;
+  # command bytes and shebangs are checked. The frozen recorder guard stays exact.
   user_data_media = <<-EOF
 #!/bin/bash
 set -eu -o pipefail
@@ -1730,24 +2197,29 @@ umask 077
 
 # install.sh (media node)
 cat > /usr/local/bin/install.sh << 'INSTALL_MEDIA_EOF'
-${local.install_script_media}
+${var.capacityReservationsEnabled ? replace(local.install_script_media, "/(?m)^[ \\t]*(#[^!\\n][^\\n]*)?\\n/", "") : local.install_script_media}
 INSTALL_MEDIA_EOF
 chmod 700 /usr/local/bin/install.sh
 
 # graceful_shutdown.sh
 cat > /usr/local/bin/graceful_shutdown.sh << 'GRACEFUL_SHUTDOWN_EOF'
-${local.graceful_shutdown_script_media}
+${var.capacityReservationsEnabled ? replace(local.graceful_shutdown_script_media, "/(?m)^[ \\t]*(#[^!\\n][^\\n]*)?\\n/", "") : local.graceful_shutdown_script_media}
 GRACEFUL_SHUTDOWN_EOF
 chmod 700 /usr/local/bin/graceful_shutdown.sh
 
-# tag_watcher.sh (detects draining tag and triggers graceful shutdown)
+cat > /usr/local/bin/courseultra-media-drain-guard << 'MEDIA_DRAIN_GUARD_EOF'
+${var.capacityReservationsEnabled ? local.capacity_python_sources["media_drain_guard.py"] : file("${path.module}/media_drain_guard.py")}
+MEDIA_DRAIN_GUARD_EOF
+chmod 700 /usr/local/bin/courseultra-media-drain-guard
+
+${local.capacity_media_drain_settings}# tag_watcher.sh (detects draining tag and triggers graceful shutdown)
 cat > /usr/local/bin/tag_watcher.sh << 'TAG_WATCHER_EOF'
-${local.tag_watcher_script_media}
+${var.capacityReservationsEnabled ? replace(local.tag_watcher_script_media, "/(?m)^[ \\t]*(#[^!\\n][^\\n]*)?\\n/", "") : local.tag_watcher_script_media}
 TAG_WATCHER_EOF
 chmod 700 /usr/local/bin/tag_watcher.sh
 
 echo "DPkg::Lock::Timeout \"-1\";" > /etc/apt/apt.conf.d/99timeout
-apt-get update && apt-get install -y \
+${local.fresh_apt_prepare}apt-get --no-download install -y \
   curl \
   unzip \
   jq \
@@ -1790,9 +2262,15 @@ export HOME="/root"
 doctl auth init -t "${var.autoscalerToken}"
 
 # Install OpenVidu Media Node
-/usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu Media Node"; exit 1; }
-
-# Mark installation as complete
+mkdir -p /etc/systemd/system/openvidu.service.d
+cat > /etc/systemd/system/openvidu.service.d/40-courseultra-drain.conf << 'MEDIA_DRAIN_BARRIER_EOF'
+${chomp(file("${path.module}/media-drain-start-barrier.conf"))}
+MEDIA_DRAIN_BARRIER_EOF
+chmod 644 /etc/systemd/system/openvidu.service.d/40-courseultra-drain.conf
+systemctl daemon-reload
+${local.recorder_guard_barrier}/usr/local/bin/install.sh || { echo "[OpenVidu] error installing OpenVidu Media Node"; exit 1; }
+${local.recorder_guard_prepare_media}
+${local.capacity_fresh_arm}# Mark installation as complete
 echo "installation_complete" > /usr/local/bin/openvidu_install_counter.txt
 
 # Start OpenVidu
@@ -1802,6 +2280,6 @@ systemctl start openvidu || { echo "[OpenVidu] error starting OpenVidu"; exit 1;
 if [ "${var.fixedNumberOfMediaNodes}" -eq 0 ]; then
 echo "*/2 * * * * root /usr/local/bin/tag_watcher.sh >> /var/log/tag_watcher.log 2>&1" > /etc/cron.d/tag-watcher
 chmod 644 /etc/cron.d/tag-watcher
-fi
+fi${local.capacity_fast_watcher_cron}
 EOF
 }

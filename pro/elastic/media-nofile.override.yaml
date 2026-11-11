@@ -1,0 +1,10 @@
+# Go raises the parent server's limit, but its mediasoup subprocesses otherwise
+# inherit Docker's 1,024 soft limit. Qualification hit EMFILE at 429 participants
+# before CPU-based scale-out. Keep the measured hard limit, raise only the soft
+# limit, and scope this to the media service rather than changing daemon defaults.
+services:
+  openvidu:
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288

@@ -57,6 +57,16 @@ variable "stackName" {
   type        = string
 }
 
+variable "isolatedRecorderGuard" {
+  description = "Fresh nodes only (legacy variable name): install an unarmed pinned recorder guard before first start. Outside qualification, requires explicit capacity configuration; never proves operating capacity or authorizes replacing an existing node."
+  type        = bool
+  default     = false
+  validation {
+    condition     = !var.isolatedRecorderGuard || var.stackName == "courseultra-openvidu-38-qualification" || var.capacityReservationsEnabled
+    error_message = "Outside the isolated qualification stack, guarded bootstrap requires explicit capacity activation and its reviewed fleet configuration."
+  }
+}
+
 variable "certificateType" {
   description = "[selfsigned] Not recommended for production use. Just for testing purposes or development environments. You don't need a FQDN to use this option. [owncert] Valid for production environments. Use your own certificate. You need a FQDN to use this option. [letsencrypt] Valid for production environments. Can be used with or without a FQDN (if no FQDN is provided, a random sslip.io domain will be used)."
   type        = string
@@ -133,27 +143,86 @@ variable "minNumberOfMediaNodes" {
 }
 
 variable "maxNumberOfMediaNodes" {
-  description = "Maximum number of media nodes (autoscaler will never scale above this)"
+  description = "Maximum media nodes; zero uses the current DigitalOcean account quota after other Droplets are counted"
   type        = number
   default     = 5
 
   validation {
     condition = (
-      var.maxNumberOfMediaNodes >= var.minNumberOfMediaNodes &&
+      (var.maxNumberOfMediaNodes == 0 || var.maxNumberOfMediaNodes >= var.minNumberOfMediaNodes) &&
       floor(var.maxNumberOfMediaNodes) == var.maxNumberOfMediaNodes
     )
-    error_message = "maxNumberOfMediaNodes must be a whole number at least as large as minNumberOfMediaNodes."
+    error_message = "maxNumberOfMediaNodes must be zero (account quota) or a whole number at least as large as minNumberOfMediaNodes."
   }
 }
 
 variable "scaleTargetCPU" {
-  description = "Target average CPU percentage for autoscaling. Scale out above this, scale in below 70% of this."
+  description = "Target average CPU percentage for autoscaling. Scale out above this; legacy scale-in below 70% requires explicit enablement."
   type        = number
   default     = 50
 
   validation {
     condition     = var.scaleTargetCPU > 0 && var.scaleTargetCPU <= 100
     error_message = "scaleTargetCPU must be greater than 0 and no greater than 100."
+  }
+}
+
+variable "automaticScaleInEnabled" {
+  description = "Opt into legacy CPU-based drain selection only after recording-safe removal qualification. Does not authorize deletion or enable capacity-mode scale-in."
+  type        = bool
+  default     = false
+}
+
+variable "capacityReservationsEnabled" {
+  description = "Use authoritative backend provisioning and guarded scale-in claims; enable only with a reviewed operating profile and rollout plan"
+  type        = bool
+  default     = false
+}
+
+variable "capacityBackendUrl" {
+  description = "HTTPS base URL of the capacity authority, including the application base path if configured"
+  type        = string
+  default     = ""
+}
+
+variable "capacityFleetDescriptorJson" {
+  description = "Explicit reviewed fleet/profile and semantic recorder-policy descriptor; no measured defaults are generated"
+  type        = string
+  sensitive   = true
+  default     = ""
+  validation {
+    # Qualification can exercise deliberately synthetic descriptors. Production
+    # must explicitly select a matching profile and authenticated HTTPS authority.
+    # This enables the SAME fresh-node guard, not arming of an existing recorder.
+    condition = !var.capacityReservationsEnabled || (var.isolatedRecorderGuard && can(jsondecode(var.capacityFleetDescriptorJson)) && (
+      var.stackName == "courseultra-openvidu-38-qualification" || try(
+        can(regex("^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?(/[^?#]*)?$", var.capacityBackendUrl)) &&
+        length(trimspace(var.capacityBackendToken)) > 0 &&
+        length(trimspace(var.capacityProfileFingerprint)) > 0 &&
+        jsondecode(var.capacityFleetDescriptorJson).operatingProfile.profile.fingerprint == var.capacityProfileFingerprint &&
+        jsondecode(var.capacityFleetDescriptorJson).operatingProfile.profile.nodeType == var.mediaNodeInstanceType &&
+        jsondecode(var.capacityFleetDescriptorJson).region == var.region,
+      false)
+    ))
+    error_message = "Capacity reporting requires guarded bootstrap and an explicit JSON descriptor. Outside qualification, configure an authenticated HTTPS authority and matching profile fingerprint, node type and region."
+  }
+}
+
+variable "capacityBackendToken" {
+  description = "Dedicated capacity authority credential; never an OpenVidu or DigitalOcean credential"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "capacityProfileFingerprint" {
+  description = "Exact qualified capacity profile accepted by the autoscaler; empty keeps capacity signals disabled"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._:-]*$", var.capacityProfileFingerprint))
+    error_message = "capacityProfileFingerprint may contain only letters, numbers, dot, underscore, colon, and hyphen."
   }
 }
 

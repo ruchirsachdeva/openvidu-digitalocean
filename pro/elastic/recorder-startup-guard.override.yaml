@@ -1,0 +1,38 @@
+# Explicit opt-in only; fresh qualification bootstrap leaves it UNARMED. The reviewed snapshot
+# and guard must exist before any first/restarted recorder can register.
+# Keep the existing Compose overrides; add this file last, never replace them.
+services:
+  egress:
+    image: docker.io/openvidu/egress@sha256:01a31780783080259b7f218f624e654dc30572be5b5f7999123ac0d98c259475
+    platform: linux/amd64
+    user: egress
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/courseultra-guard/start.sh"]
+    command: []
+    environment:
+      EGRESS_CONFIG_FILE: /config/egress.yaml
+    volumes:
+      - type: bind
+        source: /opt/openvidu/courseultra-recorder-guard/start.lock
+        target: /courseultra-guard/start.lock
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/openvidu/courseultra-recorder-guard/start.sh
+        target: /courseultra-guard/start.sh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/openvidu/courseultra-recorder-guard/egress-config.sha256
+        target: /courseultra-guard/egress-config.sha256
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/openvidu/courseultra-recorder-guard/egress.yaml
+        target: /config/egress.yaml
+        read_only: true
+        bind:
+          create_host_path: false

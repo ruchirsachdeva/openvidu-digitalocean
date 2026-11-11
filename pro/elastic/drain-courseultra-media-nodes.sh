@@ -151,7 +151,7 @@ while IFS= read -r NODE_ID; do
   HTTP_CODE="$(api_request DELETE "$DO_API/tags/$ACTIVE_TAG/resources" "$BODY")"
   case "$HTTP_CODE" in
     2??)
-      printf 'Media node %s is draining and no longer accepts new sessions.\n' "$NODE_ID"
+      printf 'Media node %s is draining by tag; provider new-work exclusion awaits the node watcher.\n' "$NODE_ID"
       ;;
     *)
       # A watcher may delete the node between tag confirmation and untagging.
@@ -173,4 +173,4 @@ if [ "$PROCESSED" -eq 0 ]; then
 fi
 
 rm -f "$IDS_FILE"
-printf 'All recorded media nodes are absent or safely draining.\n'
+printf 'All recorded media nodes are absent or have a confirmed drain request; completion remains to be verified.\n'

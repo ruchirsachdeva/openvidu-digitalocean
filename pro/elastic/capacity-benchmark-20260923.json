@@ -1,0 +1,44 @@
+{
+  "evidenceVersion": "cu-38-pion-20260923-storage-policy-20260929",
+  "workload": "Synthetic 640x360/15fps cameras (maximum two), one 1080p/15fps screen with audio, colocated 720p composed recording",
+  "sourceReport": "docs/COMBINED_CAPACITY_RESULT_2026_09_23.md",
+  "unresolvedGates": ["complete production resource and workload profile review", "scheduled prewarm and removal while another node hosts an active class", "production rollout and smoke verification"],
+  "functionalScalingEvidence": "pro/elastic/FOCUSED_SCALING_RESULT_20260924.md: automatic creation, placement and eventual idle removal passed with two eight-person rooms; not a capacity benchmark",
+  "empiricalModel": {
+    "workloadId": "pion-3.8-two-360p15-cameras-one-1080p15-screen-audio-720p-recording",
+    "planningBands": [{"maxPeople": 202, "nodeType": "c-4"}, {"maxPeople": 402, "nodeType": "c-8"}],
+    "bandMeaning": "Conservative hardware review choices, not physical cutoffs or qualified production profiles. Smaller rooms use the full band; no linear interpolation or packing credit.",
+    "stages": [
+      {"nodeType":"c-4", "people":202, "cameras":2, "meanCpuPercent":64.4, "p95CpuPercent":70.3, "finding":"CPU headroom; receiver quality confounded by browser compositor saturation"},
+      {"nodeType":"c-4", "people":302, "cameras":1, "meanCpuPercent":67.4, "p95CpuPercent":75.8, "finding":"One-camera stage, not permission to size for one when a second can activate"},
+      {"nodeType":"c-4", "people":302, "cameras":2, "meanCpuPercent":80.4, "p95CpuPercent":89.5, "finding":"Limited headroom"},
+      {"nodeType":"c-4", "people":352, "cameras":2, "meanCpuPercent":87.9, "p95CpuPercent":93.9, "finding":"Near saturation"},
+      {"nodeType":"c-4", "people":402, "cameras":2, "meanCpuPercent":94.6, "p95CpuPercent":96.5, "finding":"Severe screen stalls; reproduced at mean94.3/P95 96.2"},
+      {"nodeType":"c-4", "people":402, "cameras":1, "meanCpuPercent":79.7, "p95CpuPercent":88.1, "finding":"Delivery recovered after second camera/microphone stopped; little headroom"},
+      {"nodeType":"c-8", "people":402, "cameras":2, "meanCpuPercent":43.5, "p95CpuPercent":50.8, "finding":"Clean ten-minute measured hold; recovery hold nearly five minutes at43.6/51.2"}
+    ],
+    "concurrentOverload": {"nodeType":"c-8", "roomPeople":[402,102,102], "recordings":3, "meanCpuPercent":94.0, "p95CpuPercent":95.5, "finding":"Severe freezes; cannot sum audiences and apply single-room band"},
+    "sustainedEvidence": {"campaign":"cu-native-v3-isolated-20260921-4a8f61b2", "rooms":3, "peoplePerRoom":202, "dedicatedFourCpuNodes":4, "fullCohortMinutes":129, "placement":"Mixed forwarding/recording; one room and its recording colocated", "finding":"Sustained operation with alternating cameras, brief freezes and isolated loss; not three rooms per node or continuous two-camera qualification"},
+    "arrivalEvidence": [
+      {"campaign":"20260921", "pattern":"5 students/second for10 seconds per room, room bursts offset20 seconds", "mediaPeakTwoSecondCpuPercent":65.5, "finding":"150 burst arrivals succeeded;32-vCPU backend; not synchronized fleet bursts or a universal safe rate"},
+      {"campaign":"20260923", "pattern":"2 students/second/room", "initial200AdmissionP95Seconds":2.23, "finding":"All measured batches succeeded; observed pace, not enforced admission control"}
+    ],
+    "recordingStoragePolicy": {"referenceDurationSeconds":14400, "overrunBufferMinutes":30, "bytesPerCopy":8589934592, "copiesPerObligation":2, "nodeReserveBytes":8589934592, "basis":"Offline planning allowance: each scheduled duration plus 30 minutes, rounded up at 8GiB/14400s per copy, two copies, and one node reserve. Subtract installed/system/existing recovery use separately. Not a measured bitrate maximum, recording cutoff, active-profile migration or concentration qualification."}
+  },
+  "nodes": {
+    "c-4": {
+      "physicalCpuMillis": 4000,
+      "planningCeilingPeople": 202,
+      "forwardingEnvelopeCpuMillis": 2232,
+      "combinedEnvelopeCpuMillis": 3500,
+      "combinedEnvelopeBasis": "September21 sampled mixed-node peak3482m over17:01:22–19:33:00 including finalization, rounded up to3500m. CPU includes forwarding and recording.10% physical headroom is an explicit candidate policy; provider startup costs remain separate. Not a guarantee of recorder location/concentration or a new live pass.",
+      "basis": "Retain September 21 202-person forwarding peak, rounded up. September 23 lower peak (1717m) does not erase previous evidence. New 200-student mean total CPU 64.4%; generator caveat preserved. 300 has limited headroom; 400 failed twice. This is a review ceiling, not production qualification."
+    },
+    "c-8": {
+      "physicalCpuMillis": 8000,
+      "planningCeilingPeople": 402,
+      "forwardingEnvelopeCpuMillis": 3255,
+      "basis": "Ceiling of maximum two-second forwarding CPU in 21:05–21:15 UTC 400-student plus two-teacher hold. Total mean CPU 43.493%, P95 50.806%. Repeat recovery mean43.558%. Three recorded rooms/600 students overloaded; not a pooled600 pass."
+    }
+  }
+}

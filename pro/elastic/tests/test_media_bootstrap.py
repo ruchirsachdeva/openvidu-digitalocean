@@ -1,4 +1,6 @@
+import base64
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,8 @@ def media_install_script(root):
         "\nEOF", 1
     )[0]
     replacements = {
+        '${filebase64("${path.module}/media-nofile.override.yaml")}': base64.b64encode(
+            (ELASTIC_DIR / "media-nofile.override.yaml").read_bytes()).decode(),
         "${digitalocean_spaces_key.openvidu_space_key.access_key}": "test-access",
         "${digitalocean_spaces_key.openvidu_space_key.secret_key}": "test-secret",
         '${var.spaceName == "" ? digitalocean_spaces_bucket.openvidu_space[0].name : var.spaceName}': "test-space",
@@ -29,6 +33,9 @@ def media_install_script(root):
     }
     for placeholder, value in replacements.items():
         script = script.replace(placeholder, value)
+    release = terraform.split("openvidu_installer_release = {", 1)[1].split("}", 1)[0]
+    for key, value in re.findall(r'(\w+)\s*=\s*"([^"\n]+)"', release):
+        script = script.replace("${local.openvidu_installer_release." + key + "}", value)
     return script.replace("$${", "${")
 
 
@@ -38,6 +45,7 @@ def master_s3_config_script(root):
         "\nEOF", 1
     )[0]
     replacements = {
+        "${var.capacityReservationsEnabled}": "false",
         "${digitalocean_spaces_key.openvidu_space_key.access_key}": "test-access",
         "${digitalocean_spaces_key.openvidu_space_key.secret_key}": "test-secret",
         '${var.spaceName == "" ? digitalocean_spaces_bucket.openvidu_space[0].name : var.spaceName}': "test-space",
@@ -133,7 +141,7 @@ class MediaBootstrapTest(unittest.TestCase):
                     destination.write_text(
                         "DOMAIN_NAME=openvidu.example.com\\n"
                         "REDIS_PASSWORD=test-redis\\n"
-                        "OPENVIDU_VERSION=3.7.0\\n"
+                        "OPENVIDU_VERSION=3.8.0\\n"
                         "OPENVIDU_PRO_LICENSE=test-license\\n"
                         "MASTER_NODE_PRIVATE_IP=10.10.20.8\\n"
                         f"MASTER_NODE_ID={master_id}\\n"

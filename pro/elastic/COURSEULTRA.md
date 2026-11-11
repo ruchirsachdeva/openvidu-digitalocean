@@ -1,12 +1,408 @@
 # CourseUltra OpenVidu Elastic Deployment
 
-This directory is pinned to OpenVidu `3.7.0` and deploys the CourseUltra production cluster on
-DigitalOcean. Keep the upstream Terraform structure intact. CourseUltra-specific changes are
+## Compatible false-alarm mitigation qualification — October 28
+
+The deployed backend `145afac8` already accepts the six alert codes used by the
+read-resilience Function at `d631570`. A narrowly reviewed Function-only update
+can therefore classify failed pre-dispatch provider reads as readiness waits and
+retry safe GETs without first moving production traffic or changing that backend.
+Its existing process-local debounce handles `READINESS_UNAVAILABLE` and silently
+consumes `READINESS_RECOVERED`. This is a limited false-alarm mitigation, **not**
+shared incident delivery, paired recovery email, or full cluster-release sign-off.
+Do not point the live Function at an isolated backend/database to gain those features.
+
+Keep the complete live Function configuration and opaque media startup payload
+byte-for-byte, preserving the backend target, credentials, profile, quotas, fleet
+tags and placement. Change only the existing action's reviewed executable source;
+do not run a broad Terraform apply or alter scheduled triggers, limits or hosts.
+Check its exact current source hash before and after any separately authorized
+update. Observe subsequent scheduled checks rather than manually invoking the
+autoscaler. Missing/unknown creation outcomes still require explicit reconciliation.
+
+The four legacy-contract checks and 59 extracted autoscaler tests pass locally.
+The separately journalled October 28 rollout installed only this compatible
+executable source as action version `0.0.11`; its rendered source hash is
+`d8ae13780c3b7e1d5cb9c97cf5b19172139411b43472276eaf7f8676cb6cc287`.
+Three subsequent scheduled checks held the existing ready fleet without
+creation or alert-delivery failure. Configuration was preserved. No real
+incident/recovery email delivery is certified by those healthy checks. The later
+`c9343a5` quota/capacity recovery codes and `041c591` source-time protocol remain
+backend-first: deploy shared backend handling before those Function revisions.
+The complete recovery fix is not available from this compatibility checkout.
+
+## Bounded provider reads and readiness recovery — October 15
+
+The autoscaler now retries only DigitalOcean GET reads after HTTP 429/5xx or a
+transport timeout: at most three attempts, four-second attempt timeouts and a
+12-second per-read scheduling budget, with bounded jitter. A fresh 115-second
+monotonic budget is reset for every warm Function invocation; reads leave 20
+seconds for outcome/alert calls, and a low remaining budget holds before consuming
+a dispatch claim. Existing outbound-call timeouts are capped by that remaining
+budget. The provider's 120-second Function limit is unchanged; these are bounded
+client scheduling/socket timeouts, not an absolute deadline for a slow-dribbling
+HTTP response. Error bodies are closed without another diagnostic read.
+
+Missing inventory/account/CPU evidence is a pre-dispatch readiness wait, not
+`PROVISIONING_FAILED`, and cannot create or claim a machine. A permanent 403 is
+held without retries. Known zero account-quota headroom uses the existing capacity
+waiting/quota-pressure alerts. `READINESS_RECOVERED` requires the current complete
+read/valid-authority-claim family and is suppressed for any provisioning error or
+unknown creation outcome; it does not resolve provisioning-failure alerts.
+Provisioning/readiness signals are attempted before quota/waiting notices when
+the remaining alert budget is tight; undelivered notices remain visible.
+
+Cloud POST/DELETE/tag changes and capacity-backend POSTs remain single-attempt.
+Durable dispatch intent, outcome observation, active-creation protections and
+recording-safe drains are unchanged. Deploy the companion backend's readiness
+notification handling before updating the Function; keep outstanding intents for
+reconciliation, never force a create retry. This entry describes locally tested
+changes, not a live rollout or a new capacity qualification. No Terraform resource,
+dependency, profile, placement or node-bootstrap contract is changed.
+
+## Readiness alerts and short preparation cleanup — October 1
+
+An explicit HTTP 503 from the pre-dispatch claim endpoints is a readiness wait,
+not `PROVISIONING_FAILED`. Report wait/recovery to the backend; repeated waits
+spanning at least eight minutes produce a readiness alert. Unknown cloud outcomes,
+timeouts and failed outcome receipts remain provisioning failures. Debounce state
+is backend-process-local; deploying/restarting it restarts that observation window.
+
+If a cancelled, never-admitted preparation ended before active provenance was
+captured, the existing watcher may use two whole-recorder idle observations at
+least 30 seconds apart. Exact boot/container/process/storage identities, successful
+provider output and no remaining writers, files or backups are required. Recheck
+before submission and retain an immutable receipt for retries. This never stops
+processes, deletes recordings or relaxes ordinary admitted-class settlement.
+Mount identity comparison is order-independent because Docker may reorder the
+same mount list; changing any mount binding still retains the reservation.
+
+Activated October 1: backend `a74d10d9`, collector changes `71b6459` and
+`48fc959`. All 389 backend capacity tests and 326 infrastructure tests passed;
+20 environment-dependent infrastructure tests skipped. A live preparation was
+cancelled before active provenance was captured; the scheduled watcher released
+its reservation using `IDLE_PREPARATION` proof, without manual release or restart.
+Existing managed recordings remained READY, and test schedule/working hours were
+restored. No extra server was created. This is lifecycle verification, not a new
+capacity or media-quality qualification.
+
+Deploy the companion backend first. Install the matching collector and update
+future-node bootstrap together. Only full-line comments from the job settlement
+helper are omitted from bootstrap transport; offline tests compare Python ASTs.
+Render the actual credential-bearing payload privately and check its 64KiB limit.
+Rollback collectors/autoscaler before reverting backend support; unresolved work
+remains protected. No placement policy, node count or database migration changes.
+
+## Retain nodes carrying peer signaling — September 24
+
+The focused occupied-drain run found that shutting down a node with no local room
+or tracks but remaining peer-room signaling clients disconnected four users in the
+surviving class. Native automatic SDK reconnect is deliberately disabled pending
+safe fresh-admission recovery; room ownership elsewhere does not guarantee continuity.
+Restore the nonzero-client shutdown veto even with an application drain claim and
+a verified peer room map. No forced timeout is introduced: existing connections
+finish naturally, then the ordinary watcher can retry. This can retain a draining
+node longer and costs idle capacity, but must not interrupt another class. The
+original failure is retained; this correction is locally tested, not live-qualified.
+
+## Explicit production bootstrap eligibility — September 24
+
+The legacy-named `isolatedRecorderGuard` can now be selected outside the exact
+qualification stack only with capacity reservations enabled, a nonblank dedicated
+backend credential, an HTTPS authority without embedded credentials/query/fragment,
+and a JSON descriptor matching the selected profile fingerprint, node type and
+region. The backend/runtime still validate the complete approved descriptor;
+Terraform eligibility is not operating-profile approval. Defaults remain disabled,
+and fresh-node startup/arming code is unchanged. Existing production nodes must not
+be replaced merely to apply this validation change. The release manifest records
+the resolved-descriptor and separate rollout requirements.
+
+## Shared-server combined CPU release candidate — September 24
+
+This supersedes the proposal below to introduce separate recording workers. The
+candidate keeps the current shared-server architecture and existing scaler. Its
+new explicit backend profile option `roomCpuIncludesRecording=true` applies only
+to `POOL_ADMISSION_V1`: charge the measured combined classroom/recorder CPU once,
+not combined CPU plus a second recorder CPU allowance. Non-CPU recording resources
+are still separate, and the provider's2-core startup estimate is unchanged.
+
+`python3 capacity-benchmark.py --node c-4 --people 202 --combined-cpu` emits the
+unqualified CPU assessment: measured combined peak3482m rounded to3500m, budget
+3600m with explicit10% physical headroom. This is not the earlier20% additive
+policy and not a guarantee of all future peak loads. Add `--profile` only with a
+matching reviewed c-4 template; non-CPU values are preserved, not inferred.
+The output fingerprint includes the accounting flag. Existing calibration and
+old profiles keep their old arithmetic; no active reservation is migrated.
+
+Both first-start arming and ongoing fleet receipts require whole-host CPU
+monitoring, cpuload recording selection, utilization threshold<=80% and composed
+recording startup estimate>=2 cores matching the profile's recording CPU field
+for the combined profile. This rejects a
+process-only CPU monitor or binpacking policy even if their config was hashed.
+Readiness receipts and recording-start confirmation remain distinct; instantaneous
+CPU is not expected-enrollment reservation or a guarantee of later recorder load.
+
+The profile is a RELEASE CANDIDATE FOR TESTING, not production activation. Review
+memory, actual free disk/four-hour recovery allowances and network treatment, then
+test staggered and simultaneous recording starts followed by student arrivals,
+automatic scheduled prewarm, and idle removal while another class remains active.
+Retain failures without forcing deletion or clearing protected obligations. No
+claim of per-node recorder pinning, one-recorder limit or automatic mixed-size
+selection is made. Paired backend/infrastructure rollback must retain compatible
+profile meanings and finish outstanding recording settlement first.
+
+## Evidence-led hardware review — September 24
+
+### Earlier strict-accounting assessment (superseded for combined-CPU candidate)
+
+The recommendation is not yet an admissible production c-4 profile. Code tracing
+confirmed two distinct constraints: (1) the additive forwarding/recording budgets
+exceed c-4, and (2) provider recorder selection is independent of room placement.
+`can_accept_request` is an instantaneous observation, not a reserved job slot.
+Do not resolve this by lowering the two-core floor, assuming one job per node,
+assigning a larger profile fingerprint to smaller hardware, or removing the
+production startup guard. An eight-CPU exception alone does not solve arbitrary
+recording concentration either.
+
+If separate recording capacity is approved, reuse the existing inventory, planner,
+prewarm and scaler rather than a second scheduler: distinguish classroom-capable
+and recorder-capable nodes, retain guarded recorder exclusion on classroom-only
+nodes across restart, and prohibit classroom assignment to recording workers.
+Role-specific profiles and worst-case recording concentration/storage must remain
+explicit. This path is NOT implemented or qualified; disabling a recorder today
+also makes that node ineligible for classroom placement, so it is not a config fix.
+
+The focused operational check must use `app.scheduling.enabled=true` on its isolated
+designated backend (with isolated credentials/database), and observe the existing
+timer creating reservations before teachers start. Manual `/prewarm` calls cannot
+substitute for this proof. End one room and retain a publishing/recording room on
+the other node through exclusion, recording settlement and actual cloud deletion;
+verify no new assignments to the draining node, bounded retries, continued media
+and intact output. The previous functional test only deleted after both rooms
+ended. No new paid window has started and neither remaining live gate is marked
+passed by local tests or this checklist.
+
+TODO(engine-benchmark, non-release-blocking): compare Pion and mediasoup for
+simultaneous 25/50-student rooms on the same dedicated c-4 node, with identical
+two-camera/one-screen/audio/720p-recording workload. Record actual recording
+placement, per-core forwarding and recorder CPU, admission delays, audio loss and
+freezes; repeat the useful boundary rather than the old capacity ladder. Keep
+separate versioned engine profiles; never apply the vendor's multi-room 2x claim
+as a CourseUltra multiplier. The related backend integration-contract TODO also
+tracks the tentative OpenVidu 3.10 multi-threaded mediasoup feature: verify shipping
+status before revisiting large-room performance. Neither follow-up blocks Pion.
+
+The benchmark utility now separates **empirical hardware choice** from **allocator
+admission**. This corrects treating the additive recording reservation conflict as
+proof that a 200-student class physically requires eight CPUs. It does not weaken
+the allocator or activate a production profile.
+
+Run `python3 capacity-benchmark.py --people 202 --recommend-workload
+pion-3.8-two-360p15-cameras-one-1080p15-screen-audio-720p-recording` (one line).
+Full attendance includes teachers; the bands are at 202 and 402 total people,
+not students alone. The exact profile assumes dedicated regular c-series hardware,
+OpenVidu 3.8/Pion and the resolutions/frame rates stated in the evidence JSON.
+
+- Up to 202 people: c-4 hardware-review candidate. The September 21 full-cohort
+  observation lasted about 129 minutes across three rooms/four c-4 nodes, including
+  one colocated room/recorder. Brief freezes, isolated loss and alternating cameras
+  remain caveats. September 23 adds whole-node CPU measurements, with its initial
+  generator issue preserved rather than counted as a clean receiver pass.
+- 203–402 people: c-8 hardware-review candidate. The 203 boundary is conservative
+  policy, not a measured failure at 203. c-4 at 300 students consumed 67.4% mean
+  with one camera versus 80.4% with two; at 400 it repeatedly stalled. A muted
+  student does not earn capacity credit when their camera/microphone may return.
+  The c-8 clean 400-student hold was ten minutes, not long-duration qualification.
+- Above 402, multiple rooms or multiple recording obligations: no automatic
+  hardware recommendation from this dataset. The 400+100+100 c-8 overload is
+  explicitly retained. Fifty-person rooms are not assumed to cost one quarter of
+  a 200-person room. Evaluate rooms separately; this is not a mixed-size scheduler.
+- Arrivals retain their actual patterns: two students/second/room in the later
+  comparison and five/second ten-second bursts with class starts offset twenty
+  seconds in the earlier run. Neither is an enforced throttle or proof of an
+  optimal rate. CPU headroom and application join latency are separate signals.
+- Recording storage reports the existing four-hour planning allowance: 24 GiB
+  per unresolved recording obligation plus 8 GiB per node. Installed usage and
+  retained recovery files must be deducted from actual disk free space; these
+  allowances are not observed maxima or a four-hour recording proof.
+
+The output includes the unchanged allocator assessment and its c-4 accounting
+conflict, not just a recommended node. Observed whole-node CPU already includes
+recording; do not add recording CPU to that measured percentage again. Conversely,
+those averages/P95 values are not substitutes for peak reservations. Resolving the
+production recording eligibility/budget contract remains necessary. This change
+does not claim live placement integration, node creation or release approval.
+
+Functional scaling gates are updated separately: September 24 demonstrated ready
+node creation, placement and eventual idle removal. Scheduled prewarming and removal
+while another node still hosts a class remain distinct, as does production rollout.
+No broad benchmark rerun or new infrastructure is required by this offline update.
+
+## Fresh package-source fix — September 24
+
+Fresh master, fixed-media and autoscaled-media bootstrap now replace only the exact
+DigitalOcean Ubuntu mirror URI with the official Ubuntu archive before the first
+package update. The September 23 nodes failed on inconsistent DEP11 metadata from
+that mirror; manual repair is now represented in the provisioning source. Original
+source files are backed up once. Suites, components, security repositories and
+signature verification remain unchanged. Already-installed nodes are not repaired
+by this helper. A changed `user_data` can cause Terraform replacement: review the
+plan and never apply a master replacement to production as a routine patch.
+Installer versions/checksums, Redis persistence and recording guards are unchanged.
+Local tests do not establish live bootstrap success; the focused check must do so.
+
+## Benchmark calibration — September 24
+
+`capacity-benchmark.py` evaluates the September 23 dedicated c-4/c-8 measurements
+against the existing `POOL_ADMISSION_V1` arithmetic. This is an offline preparation
+tool, not a second scheduler or a live configuration change. Supply full enrollment
+plus teachers/other attendees using `--people`; no no-show discount is applied.
+The default 20% CPU headroom is an explicit conservative planning assumption, not
+a measured safety guarantee. It can be varied for review without altering production.
+
+Examples: `python3 capacity-benchmark.py --node c-4 --people 202` exposes the
+existing 2,232m forwarding + 2,000m recording conflict. Adding more c-4 nodes does
+not make that colocated envelope fit. `--node c-8 --people 402` fits CPU arithmetic:
+6,400m budget minus 3,255m full-room forwarding minus 2,000m recording = 1,145m.
+The recorder allowance is reserved once per node by the existing admission mode.
+Another room cannot use that already-charged room budget, even if only a few people
+are currently connected. Smaller rooms conservatively use the same full envelope;
+these measurements do not establish a linear slope or safe small-room packing.
+
+Optional `--profile existing-profile.json` emits the existing profile format with
+only CPU/ceiling/evidence fields recalibrated. All non-CPU fields are retained for
+review, **not validated or qualified by this tool**. Hardware and recorder allowance
+must match the template. Output always has `qualified=false`; its fingerprint changes
+when its content changes. Do not modify live reservations to adopt it.
+
+The physical/default media size remains unchanged. Neither the 600-person overload
+nor a short 400-person success activates a production profile. Automatic mixed-size
+selection is not implemented by this utility. See `docs/COMBINED_CAPACITY_RESULT_2026_09_23.md`
+for quality caveats and the remaining live-scaling gates.
+
+TODO(benchmark-refresh): after changing CPU model/size, engine/version, camera/screen
+resolution or frame rate, recording preset/layout, or colocating other work, gather
+new matched forwarding/recording peaks and user-visible quality. Version the evidence
+JSON, re-evaluate the fixed envelope, recording floor, headroom and non-CPU budgets,
+then review a new fingerprint. Never scale these numbers proportionally by vCPU count
+or erase earlier worse measurements with a newer lower average.
+
+Capacity-created media nodes now carry the exact stack ownership tag in addition
+to their media tag, matching isolated inventory and cleanup ownership checks.
+Legacy CPU-mode node tags are unchanged. This does not retroactively tag nodes.
+
+## Startup payload transport — September 23
+
+Master, fixed media and autoscaled media startup scripts now use a gzip/base64
+shell envelope. The envelope verifies SHA-256 before execution, retains the child
+exit status and removes the private decoded temporary file on normal exit.
+Compression is not encryption; user data and Terraform state remain sensitive.
+Capacity helpers use quoted literal here-documents so compression can reuse common
+source text; tests verify their exact installed content and delimiter safety.
+
+Terraform guards fixed-node payloads and the autoscaler checks media payloads before
+creation against 65,536 bytes. Offline synthetic capacity-enabled rendering currently
+uses 61,563 bytes (master) and 52,639 (media). Media reuses the already-installed
+drain helper via a copy rather than embedding its source twice; both destinations
+retain the exact reviewed contents and permissions. Rendering with the September 23
+campaign's private credentials/profile (synthetic resource IDs, no cloud creation)
+passed at 63,255 and 54,703 bytes. Actual credentials/profile data change these sizes;
+verify the actual rendered sizes before each campaign. No live bootstrap is
+qualified by these tests; the campaign remains blocked on external access checks.
+Reverting restores the oversized raw payload and can reintroduce provider rejection;
+do not apply user-data changes to running nodes without reviewing replacement plans.
+
+## Successful recording settlement during drain — September 23
+
+Capacity-mode final drain checks now run `settle-recordings.py` before requesting
+final application clearance. The existing guard verifies clean stopped media,
+restart exclusion and complete Linux process/storage evidence. The backend supplies
+only exact closed/imported parts for the durably excluded recorder. Receipts are
+stored privately before delivery, bound to boot/container/recording identity, and
+reused after uncertain HTTP outcomes. Nothing is deleted by the collector.
+
+After a no-writer proof, empty NE/EGH directories and retired service socket inodes
+are data-free residue rather than recordings. Regular files (including zero-byte
+files), backup contents, preserved archives, unfinished intents or incomplete probes
+still hold the server. Capacity-disabled storage checks retain their prior strict
+empty-directory behavior. Unknown recording placement remains protected. This is
+locally tested successful-path wiring, not live qualification or a failed-upload
+cleanup mechanism; readiness/profile/rollout gates remain.
+
+## Actual recorder location reporting — September 23
+
+Capacity-enabled media watchers now report positive native recording placement using
+the pinned current recorder's structured job/handler/service identities. The existing
+machine credential, watcher and root-private settings are reused. Unknown or ambiguous
+logs leave ownership protected, and a changed boot/container prevents reporting. Each
+invocation is bounded so reporting cannot indefinitely prevent guarded drain attempts.
+
+The backend pins the exact recording attempt to an inventoried recorder incarnation;
+it does not assume the room server performs recording. An unrelated idle node can then
+pass application clearance while the actual recorder remains protected. This reports
+location only: it does not settle recordings, remove recovery files, assert recorder
+readiness or authorize deletion. Capacity remains disabled pending the complete fleet
+and physical-settlement producers, a defensible profile and focused live acceptance.
+
+## Reservation-aware automatic drain delivery — September 23
+
+When both existing capacity and automatic-scale-in switches are enabled, a no-create
+provisioning response now leads to `/webhooks/openvidu/capacity/claim-drain`. The backend
+selects and durably excludes one exact idle incarnation under its allocation fence.
+It preserves the configured ready minimum, queued room demand and aggregate recording
+headroom. The function verifies that the receipt identifies a current active Droplet
+of the configured size/region, adds the draining tag, then removes the media tag.
+Failed/lost tag responses do not undo exclusion or authorize another node. The same
+pending target is returned on retry after the capacity plan has refreshed.
+
+This starts only the existing guarded graceful drain. It does not delete a Droplet,
+settle a recording, or replace final application/physical storage clearance. Default
+switches and the backend activation guard remain unchanged. Operational reporting,
+recording settlement and live acceptance are still required. No new scheduler, cloud
+credentials, timer or participant-side work was introduced.
+
+## Idle-node application exclusion — September 23
+
+With the existing `capacityReservationsEnabled` switch, media bootstrap installs the
+existing backend URL/credential into a root-private drain settings file. Initial mutating
+drain-guard checks call `/webhooks/openvidu/capacity/begin-drain`; the final storage/restart
+check calls `/exclude-idle` and requires `applicationObligationsClear=true` before deletion.
+Beginning drain excludes new assignments but retains finalizing recording obligations
+for confirmed-closed rooms. Final clearance still vetoes those obligations. Keeping
+these separate avoids requiring settlement before the shutdown needed for its physical
+verification. A begin acknowledgement is never final deletion clearance. HTTP failure,
+redirect, mismatched identity or a changed boot holds the node; no saved successful
+response substitutes for a new check. The guard durably saves only provider/Droplet/boot
+identity, not credentials, before shutdown removes provider registration.
+
+The trusted fleet producer must identify `Node.id` using provider registration and
+`Node.generation` using `/proc/sys/kernel/random/boot_id`. An absent first registration
+cannot acquire this exclusion. Do not erase the identity file or application exclusion
+tombstone to force a retry after reboot. Existing ready-peer minimum, graceful one-shot
+signals, restart fencing and recording-file preservation remain additional requirements.
+
+This is not activation: reservation-mode scale-in requires the explicit existing switch,
+and the backend startup guard remains. Complete trusted fleet/recording/storage inputs
+and focused live acceptance are still required. Unknown pooled recorder placement holds
+removal while a dispatched recording is unsettled; no cloud tag is treated as proof that
+the provider has excluded new jobs. Capacity-disabled behavior remains unchanged.
+No new production settings or paid infrastructure were applied. Roll back only with
+capacity disabled and preserve all recording data and exclusion identities.
+
+Local checks after the two-phase follow-up: 234 infrastructure tests ran (215 passed, 19 platform/tool skips);
+the focused Linux drain/startup/preservation suite ran 96 (95 passed, one missing
+Compose-tool skip). Terraform format/validation passed. These exercise local fake
+provider/HTTP responses, not live scale-in or an enabled capacity deployment.
+
+This migration branch is pinned to OpenVidu `3.8.0` for an isolated comparison; the
+current production engine/version must be reverified before rollout. Do not use
+the production backend/state for this candidate. Keep the upstream
+Terraform structure intact. CourseUltra-specific changes are
 limited to production safety and repeatability:
 
 - the broad provisioning token is used only by Terraform;
 - a separate scoped token is embedded in the autoscaler and draining media nodes;
-- scale-in occurs below 70% of the scale-out target to prevent node churn;
+- automatic scale-in is disabled by default without disabling scale-out; the legacy
+  opt-in path uses 70% of the scale-out target but is not recording-safe qualification;
 - SSH is restricted to configured operator CIDRs;
 - Route53 is updated from Terraform and the master waits for DNS before requesting its certificate;
 - Terraform state is kept in a private, encrypted, versioned S3 backend;
@@ -41,6 +437,389 @@ The application continues to use OpenVidu's v2 compatibility API. This deploymen
 a new CourseUltra session model or browser integration.
 
 ## Architecture decision
+
+### Persistent drain and one-shot shutdown — 22 September 2026
+
+The media bootstrap installs `media-drain-start-barrier.conf` before the vendor
+installer. On an authorized drain the existing guard durably marks the node,
+verifies that systemd has loaded the barrier and disables automatic restart for
+the exact media/ingress/egress/agent containers. This does not stop active work;
+the supported graceful signal remains responsible for excluding new provider work.
+A cloud drain tag alone is not evidence that provider assignments have stopped.
+
+Watcher retries now send SIGQUIT at most once per exact container/process. A
+durable receipt is written before signaling and confirmed only on success. This
+avoids depending on repeated signals being harmless: upstream LiveKit handles a
+second shutdown signal as a forced stop. A lost signal acknowledgement, changed
+process/container, changed barrier, non-clean exit, retained recovery artifacts or
+missing ready peer holds deletion. The watcher never clears those obligations by
+timeout. Restart exclusion and storage are checked again immediately before removal.
+
+Operational recovery is deliberate: preserve the marker, receipts, recordings and
+logs; establish the actual process/provider outcome before resuming drain or
+returning the node to service. Do not delete an uncertain receipt to retry a signal,
+clear the marker on a timer or manually recreate containers during drain. Root-level
+manual replacement is outside the guard's normal managed lifecycle.
+
+**Deployment boundary:** this changes media-node user-data, not master user-data.
+Existing nodes do not inherit it automatically. Review the Terraform replacement
+plan and preserve occupied nodes and their recording/recovery files; do not run an
+unreviewed apply. Reverting source alone does not undo a running drain or safely
+restore container restart policies. These safeguards are independent of the 3.8
+migration and do not require a frontend/backend deployment.
+
+**Still unqualified:** a clean recorder exit and empty local recovery paths are
+additional deletion vetoes, not proof that every provider recording has reached a
+terminal state with durable output. Keep automatic scale-in disabled until that
+obligation and the focused live drain/ready-node sequence are verified. No live
+capacity or production scale-in claim follows from the local tests.
+
+Verification: 215 macOS tests discovered, 196 passed and 19 environment-specific
+skips; the overlapping offline Linux scaler/drain/preservation selection passed
+all 95 tests. Terraform formatting/validation and whitespace checks passed. No
+cloud mutation was performed for these checks.
+
+### Agreed release scope and future benchmark refresh — 22 September 2026
+
+Reuse the preserved qualification results for their exact hardware, provider/engine,
+workload and recording placement. Do not repeat the broad capacity ladder. The
+remaining focused scaling check must establish ready-node addition and safe idle-only
+removal, not infer them from pre-provisioned load results. No additional vendor inquiry,
+custom recorder fork or new scheduler is planned. The unqualified enrollment adapter
+stays disabled; its conservative model is not a provider capacity limit or a reason
+to block independent release checks.
+
+Scale-in acceptance: exclude new assignments before the final idle check; account
+for starting/running classes, pending starts, recording finalization and unresolved
+recovery files. Unknown state retains the node and is reported. A timeout never
+authorizes forced deletion. This is the agreed target, not a claim it is live-qualified.
+
+Recording idempotency is **per classroom generation and recording part**, not a
+one-recording limit across the fleet. Concurrent teachers, repeated clicks and lost
+responses must converge on the same persisted start attempt. Reconcile an uncertain
+provider result before issuing another start; a new request key alone cannot bypass
+an existing recording. Allow sequential parts only after the previous recording has
+definitively stopped. Keep concurrent classes independent. Reuse and verify the existing
+native start-intent/dispatch safeguards rather than creating another locking system.
+
+#### Planned follow-up: refresh operating limits using production evidence
+
+**Status: backlog, not started; not a release gate.** Owner: live-session qualification
+and infrastructure/capacity maintainers. No collection job, automation or new telemetry
+service is enabled by this plan.
+
+- Start from the preserved benchmark manifests and failures, retaining exact versions,
+  node plan/CPU type, engine, workload and room-versus-recorder placement. Keep the
+  previous three-camera/three-screen workload separate from the newer classroom policy.
+- Reuse existing monitoring and application/provider events to summarize real classes:
+  enrolled and actual peak attendance, concurrent rooms, active publishers/tracks,
+  720p recording jobs and placement, arrival rate, join latency/failures, reconnects,
+  interruption duration/recovery, per-core/node/master CPU, memory/network pressure,
+  recording finalization/failures and scaling decision-to-ready/drain durations.
+  Label missing measurements; do not introduce per-browser provider polling.
+- Group comparable configurations; report class counts, observed hours, peak/p95
+  loads and quality incidents with denominators. Keep failed classes in the sample;
+  separate backend/admission, browser/network, forwarding and recording bottlenecks.
+  Use aggregated or pseudonymous identifiers, existing retention/access controls,
+  and no raw classroom audio/video, credentials or student names for this analysis.
+- Review after a representative set of production classes spans the intended peak
+  and concurrency range, and before any server size/CPU type, engine/version, media
+  policy or recording setting change. Sparse low-attendance data cannot justify
+  higher limits or a no-show discount. No invented sample count or calendar deadline.
+- Deliver a versioned operating-profile update with evidence links, limits, headroom,
+  readiness lead time, limitations and rollback to the prior profile. Require explicit
+  review before changing live thresholds; no automatic limit increases from averages.
+  Use targeted synthetic testing only for gaps or proposed limits beyond observed data.
+
+### Recorder admission contract investigation — 22 September 2026
+
+The exact cached AMD64 recorder image pinned by `prepare-fresh-recorder.py`
+reports `egress version 1.12.0`. An offline binary check confirms that
+`cpu_cost.max_concurrent_web` is silently ignored, even with a non-numeric value;
+the recognized `max_pulse_clients` rejects that same invalid type. The deliberately
+incomplete test configuration then fails at service startup without Redis. That is
+a parser characterization, not successful recorder startup or a production failure.
+Reproduce without cloud infrastructure or pulling a different image:
+
+```sh
+python3 pro/elastic/tests/check_recorder_admission_contract.py --runtime
+```
+
+Do **not** configure the historical upstream `max_concurrent_web` property as a
+recording-count guarantee. In the inspected [OpenVidu recorder source](https://github.com/OpenVidu/egress/blob/5172055f74e35927b877b0bd0b006cf9508160cf/pkg/stats/monitor.go),
+`max_pulse_clients` measures PulseAudio clients with a temporary admission hold,
+not the lifetime of a recording including finalization/upload. CPU admission costs
+also have a 15-second initial hold followed by measured usage. Raising the composed
+recording cost above the configured CPU budget is not a one-job limit: unlike
+upstream LiveKit, this OpenVidu source does not exempt the first job from that
+budget, so the first recording can be rejected too. A nonzero request CPU estimate
+can also override the configured cost. Source revision and image provenance have
+not been matched; the version string alone must not be treated as that proof.
+
+This closes off two unverified shortcuts; it does not unblock the scheduler. The
+backend's current `POOL_CONCENTRATION_V1` budget charges the maximum outstanding
+recording obligations on every eligible worker. Three obligations at its 2000m
+planning minimum require 6000m on each worker and cannot fit on c4, regardless of
+how many c4 workers are added. Do not lower the minimum, assume co-location, or
+turn on the activation flag to hide this mismatch.
+
+These findings limit the current strict reservation model. The subsequent agreed
+release scope above does not pursue a custom image or another support inquiry and
+does not make a per-worker recording-count guarantee a prerequisite for independent
+release checks. Enrollment activation remains blocked on its own accurate model;
+automatic removal remains disabled until its focused safety qualification passes.
+This investigation changed no provider setting and provisioned no servers.
+
+### Separate scale-out from unqualified removal — 22 September 2026
+
+September 23 follow-up: the first drain attempt now checks the candidate's own
+identity-bound, fresh native room/client/track counters before altering restart
+behavior. Any occupied, missing or stale observation holds it. A retry after all
+media containers have exited cleanly may continue without native registration.
+This closes the missing occupied-media veto, not the separate recording/reservation
+gate or the new-start exclusion race. Graceful one-shot shutdown and storage vetoes
+remain necessary; automatic scale-in remains disabled until the complete path passes.
+
+`automaticScaleInEnabled` defaults to false. Minimum recovery and CPU-driven scale-out
+remain available; lowering the maximum never bypasses the removal switch. Capacity
+mode still refuses automatic scale-in regardless of this legacy switch. This does not
+enable the disabled enrollment adapter, establish a numeric safe class capacity, or
+cancel existing drain tags/watchers. Inventory and reconcile those before rollout.
+
+The final on-node drain guard now also inspects the stopped recorder's actual storage
+bind and refuses deletion for retained tmp/backup entries, preservation intent/archive,
+missing or redirected directories, abnormal exit or a changed recorder identity. It
+does not delete artifacts or infer a successful upload from an empty directory. Even
+empty retired job directories require review; expect some drains to remain held.
+
+These are local safety fixes, **not completed idle-only scale-in**. Before enabling it,
+the shared capacity owner must exclude new room and recording work, account for all
+pending reservations and finalization, and verify provider settlement. Polling empty
+directories or clean container exits is not that authority. Live placement, qualified
+profiles and the focused creation-to-removal browser campaign remain required.
+
+Apply neither this checkout nor user-data changes blindly to production: review the
+exact Terraform plan for master/media replacement. Action-code updates can disable
+new automatic drains without replacing nodes, but existing nodes need a separately
+reviewed guard installation. Keep the 3.8 migration history separate. No infrastructure
+was provisioned or changed to verify this patch; tests exercise rendered scaler code,
+the real shell removal ordering with fake cloud commands, and temporary local storage.
+
+Read-only production inventory on September 22 found the retained Bangalore master
+and media node both on `s-4vcpu-8gb`. The deployed Functions action reports media size
+`s-4vcpu-8gb`, minimum 1, maximum 4 and target CPU 50; its four-minute trigger is
+enabled. This is not the dedicated-CPU 3.8/Pion qualification configuration. These
+observations do not verify the running engine/version or authorize a production resize.
+
+A later authenticated, read-only SSH check on September 22 confirmed the retained
+master runs operator/dashboard/v2-compatibility images tagged **3.7.0**, and its
+OpenVidu service is active. The compatibility sessions endpoint reported zero rooms
+at the observation time. This does not establish the media engine or native room
+inventory. The retained production cluster is not the isolated 3.8/Pion qualification
+fleet; a production upgrade must be reviewed separately from the drain patch.
+
+Verification of this patch: Terraform configuration validation and formatting pass;
+the final macOS suite discovers 203 tests (184 pass, 19 skip), and the overlapping
+offline Linux scaler/drain/preservation selection passes all 83 tests. The older
+standalone autoscaler migration test cannot run in the recovered clone because its
+historical baseline `7e93682` is absent. Do not replace that baseline with HEAD to
+manufacture a migration pass; restore the exact history before claiming that coverage.
+
+### Reject incomplete master topology before provisioning dependents — 21 September 2026
+
+The master resource now requires a valid private IPv4 provider observation before
+dependent media or autoscaler configuration can consume it. An isolated fresh
+bootstrap returned a master ID with an empty private-IP attribute; both media
+startup and drain templates consequently contained an empty expected IP. The
+existing shared-secret generation check correctly refused startup. Keep that
+immutable master-ID and IP check; do not substitute an unverified address.
+
+This guard stops dependent work, not the already completed master creation. On
+failure preserve state, confirm the exact created master and its VPC/API/metadata
+address, refresh the provider observation, then review a new plan. Do not blindly
+repeat creation, taint the master or remove recorder/drain protections. The guard
+does not automatically recover a provider observation or repair existing nodes.
+
+Offline `tests/test_master_topology.py` executes the actual lifecycle condition
+with Terraform's built-in local resource and an initially unknown computed output.
+It checks invalid/missing addresses block both consumers while retaining the
+master, and a valid address permits them. No cloud resources are used. This adds
+no user-data or recording-policy changes. Deployment and real-provider recovery
+remain separately reviewed gates; reverting the guard does not repair any node.
+
+### Redis 8.6.4 isolated compatibility candidate — 13 September 2026
+
+The fresh preparation allowlist also accepts exact Redis 8.6.4-alpine, the default
+in the inspected OpenVidu 3.8 master installer. Both Terraform installer checksums
+and version now select 3.8 together; this is not deployment approval. The local runtime
+test now accepts `--redis-version 8.6.4-alpine` and verifies the observed image ID.
+Its default remains 8.6.2-alpine. Unknown versions remain rejected.
+
+8.6.4 passed real Compose preparation, AOF/everysec verification, clean stop and
+container recreation, and restoration of a stopped synthetic dataset copy. Tests
+used local Docker Desktop ARM64, no host ports and no production data; they do not
+qualify production AMD64, vendor-generated 3.8 Compose/entrypoint compatibility,
+cross-version data migration/rollback, host loss or abrupt power failure. Re-run
+those distinct gates before deploying; do not treat an image-tag allowlist as proof.
+
+The additional `--runtime --upgrade-rollback` mode starts at 8.6.2, restores a
+stopped synthetic copy, upgrades that copy to 8.6.4, writes another receipt and
+snapshot, then cleanly stops and runs 8.6.2 against that same updated copy. Both
+receipts survived the local ARM64 check. This is a narrow AOF-backed Redis result,
+not an RDB-only migration, production AMD64 or whole-OpenVidu rollback qualification.
+Never substitute a stale pre-upgrade backup for preservation of newer receipts.
+
+```sh
+python3 pro/elastic/tests/check_fresh_redis_runtime.py --runtime --redis-version 8.6.4-alpine
+python3 pro/elastic/tests/check_fresh_redis_runtime.py --runtime --upgrade-rollback
+```
+
+### Preserve the qualified media socket-limit setting on fresh nodes
+
+Fresh media bootstrap installs the media-only Compose override before invoking
+the pinned vendor installer: nofile soft 65536, hard 524288. This carries forward
+the socket-exhaustion protection from the qualification environment; it does not
+solve the separate single-core media bottleneck or establish participant capacity.
+An existing, different operator override refuses installation instead of being
+overwritten. Existing nodes are not modified. Verify the rendered vendor Compose
+and actual mediasoup child-process limits during fresh-node qualification, including
+after an installer upgrade. A source-order test alone does not prove those limits.
+
+### Guard vendor automatic startup during fresh installation
+
+The inspected vendor installer enables openvidu.service before our fresh Redis
+preparation. Repository restart checks alone cannot protect a reboot in that gap.
+Fresh master bootstrap now installs a systemd ConditionPathExists drop-in before
+the vendor installer and creates its private completion marker only after Redis
+preparation succeeds. It reloads systemd before the first deliberate start.
+Do not manufacture the marker after a failed preparation. This is fresh bootstrap,
+not an existing-master migration, and changes master user data. Full Linux boot
+qualification and real Terraform replacement review remain required. The marker
+records successful preparation; it is not a continuous integrity/health check.
+
+### Ready-floor and clean-exit drain protection — 13 September 2026
+
+Before shutdown and again before self-deletion, the media watcher verifies enough
+other nodes have matching cloud/native identities, serving state, recent heartbeats
+and a healthy endpoint. A Redis claim excludes concurrently draining peers from
+spare capacity. Claims do not expire by elapsed time; unregistered native nodes are
+removed from the claim set. Unknown inventory, master identity or provider state
+holds drain. The helper uses existing private Redis/doctl credentials and is embedded
+in fresh media bootstrap; this does not update already-running nodes automatically.
+
+Docker query/signal failures hold drain. Deletion requires every expected media and
+agent container to have exited cleanly, without OOM; missing containers are not
+proof of successful shutdown. The ten-minute watcher bound only ends an attempt,
+never authorizes forced deletion. Held nodes can incur cost and require investigation.
+
+These are necessary protections, NOT recording-finalization verification. Native
+terminal recording status and durable output checks are still missing from the
+deletion path, and occupied-class/drain qualification is incomplete. Do not deploy
+this bundle as proof of recording-safe scale-in. Revalidate the 3.7 native registration
+schema before any 3.8 migration. No image/version changes are included here.
+
+### Autoscaler namespace lifecycle — 13 September 2026
+
+Action-code changes redeploy the action without deleting its namespace. Namespace
+teardown now belongs to a separate lifecycle resource with stable stack/region
+triggers. Dependencies retain namespace cleanup before dynamic media cleanup on
+stack destruction. Keep this split when reverting action code: reverting to the
+old resource layout can destroy the namespace.
+
+The local `tests/check_autoscaler_lifecycle.py` fixture retains the actual resource
+and provisioner structure while replacing cloud commands with local event markers.
+It exercises an old-state transition, another code update and stack destroy using
+disposable Terraform state. It is not a production plan or cloud API verification.
+Before deployment inspect the real plan: no master/media/bucket replacement or
+namespace deletion is permitted for an action update. Do not apply these broader
+bootstrap changes to production merely to install this lifecycle correction.
+
+### Count retained draining servers — 13 September 2026
+
+Autoscaling reads both active and draining tag inventories, deduplicates Droplet IDs,
+and counts their union against the existing maximum for both minimum recovery and
+CPU-driven provisioning. A newer drain listing overrides an older active listing.
+Unknown inventories hold scaling. Any outstanding drain defers further scale-in.
+This prevents draining-only servers held for recovery from disappearing from the
+allocation count. It does not prove readiness or recording completion.
+
+At the maximum, retained drains can block minimum-capacity recovery; investigate
+the held drain instead of deleting it or silently exceeding the limit. Inventory
+reads are not an atomic cross-invocation provisioning lock, so this is not a hard
+concurrency guarantee. Deployment still requires the separately reviewed namespace
+lifecycle split; applying this action-code change through the old destroy-on-update
+resource is not approved. No OpenVidu or Redis version changes are included.
+
+### Interrupted master installation guard — 13 September 2026
+
+The shared master restart script now requires the existing marker to contain
+`installation_complete`, not just exist. The installer writes `1` early; treating
+that as completion could skip fresh Redis preparation after an interrupted install.
+Incomplete or missing markers refuse before service/configuration changes. Inspect
+the original bootstrap failure; do not manufacture a completion marker or wipe data.
+Completed installations retain their stop/configuration-refresh/start sequence.
+This guards the repository restart/retry path, not independent vendor systemd startup;
+full Linux boot and interrupted-install qualification remain required before deployment.
+
+### Installer release consistency — 12 September 2026
+
+The `openvidu_installer_release` local in `tf-do-openvidu-elastic.tf` binds the master
+version and both installer SHA-256 fingerprints together. This candidate selects **3.8.0**.
+New media nodes reject a shared version that differs from this reviewed release before
+downloading an installer. They still check the artifact checksum before execution.
+Do not change `OPENVIDU_VERSION` in shared secrets alone to perform an upgrade.
+
+For an upgrade, review and update all three values together, verify the customized browser
+SDK, fresh-master Redis persistence/restore, and native readiness/drain contracts, then review
+the full Terraform plan and data-preserving rollback before applying. These code changes are
+not deployment approval. Changes to master user data can replace the master; this refactor
+preserves the currently rendered master installer, but adds a media-bootstrap guard and
+therefore changes the autoscaler's embedded bootstrap. Do not apply it independently of the
+existing autoscaler lifecycle-safety review.
+
+This change does not implement fresh-master Redis persistence, upgrade a running node,
+restore missing recording history, or qualify classroom capacity. Those remain separate gates.
+
+### Fresh-master Redis persistence candidate — 12 September 2026
+
+Fresh installation prepares a persistent `/opt/openvidu/data/redis` bind mount before
+the first `systemctl start openvidu`. The helper preserves existing Meet override text,
+validates the effective Compose change is Redis-only, and enables AOF with `everysec`
+plus graceful shutdown. It refuses existing OpenVidu/Redis containers (including stopped
+ones), nonempty data, existing Redis customization, unsupported configuration shapes and
+unreviewed Redis images. Refusal requires investigation; never delete data to pass this check.
+
+This is **not an existing-master migration**. Applying changed Terraform master user data
+may replace the master. Do not apply against production as a way to install this fix.
+Existing recording state requires the separate stopped-snapshot, off-host backup and
+staged RDB-to-AOF migration procedure. Persistent host storage does not survive master
+deletion and `everysec` is not zero-loss or high availability.
+
+Status: locally verified, not deployed. The 68-test infrastructure suite passed, including
+13 preparation/refusal tests. A real isolated Docker test passed fresh startup, clean shutdown,
+state survival across recreation, and restoration of a stopped dataset copy. The observed
+Redis image ID matched `c5e375abb885e6b2021c0377879e4890bf76f9065b8922ffc113f2b226b9fc17`.
+Full cloud-init on a fresh Linux master, interrupted-install/reboot behavior and a safe
+Terraform replacement/rollback plan remain deployment gates.
+TODO on every server upgrade: review the Redis entrypoint, image allowlist, data
+mount, permissions and restart survival together; do not merely change the version check.
+
+Repeatable local verification (Docker Desktop context only):
+
+```sh
+python3 pro/elastic/tests/check_fresh_redis_runtime.py
+python3 pro/elastic/tests/check_fresh_redis_runtime.py --runtime
+```
+
+The first command validates real Compose rendering without a running engine; it does not
+prove Redis persistence. The explicit runtime mode uses a uniquely named, network-isolated,
+one-CPU/256-MiB test container with synthetic state and no host ports, verifies clean stop
+and state survival across recreation and stopped-copy restore, then removes that project's
+containers. Temporary data and the verification receipt remain for inspection. The runtime
+check also enforces the reviewed image ID. These checks do not qualify cloud-init lifecycle,
+automated off-host backups, full-disk behavior, host loss or occupied-class continuity.
+
+### Regional topology
 
 CourseUltra already uses OpenVidu's moderated WebRTC room, v2-compatibility API, recording lifecycle,
 and in-place subscriber/publisher promotion. The DigitalOcean deployment keeps that application
@@ -478,9 +1257,30 @@ rollback.
 
 ## Upgrade discipline
 
+### September 24 startup packaging correction
+
+The combined-CPU candidate's actual private configuration rendered a66,139-byte
+master startup payload, above DigitalOcean's65,536-byte limit, despite the
+synthetic-credential test fitting. Only media-node watchers execute the local
+recording-location reporter. Install that helper on media nodes only; the master
+retains fleet reporting and its required dependencies. Helper bytes and drain,
+recording and startup guards are unchanged. The same private configuration then
+rendered63,035-byte master and57,919-byte media payloads. Render each deployment's
+actual configuration before provisioning; synthetic tests now reserve2,000 bytes
+for configuration variance. This is an offline packaging correction, not a live
+scaling or production-release pass.
+
 OpenVidu recommends redeploying DigitalOcean Elastic stacks for upgrades. Start each upgrade from
 the new upstream tag, reapply the small CourseUltra patch deliberately, run `terraform validate`
 and a full plan, and deploy side by side when the upgrade changes OpenVidu services or networking.
 Re-download installer and CLI artifacts over HTTPS, review their release changes, and update pinned
 SHA-256 checksums only after verification. Do not merge arbitrary upstream `main` changes into a
 running production stack.
+
+
+## Shared media capacity candidate
+
+The paired backend/collector candidate uses physical worker holds for foreign work.
+See [SHARED_MEDIA_CAPACITY.md](SHARED_MEDIA_CAPACITY.md) for accounting, rollout
+requirements and the limits of observation-based admission. No deployed changes
+are implied by this source change.

@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+bootstrap_script=$(mktemp /tmp/courseultra-bootstrap.XXXXXXXX)
+trap 'rm -f -- "$bootstrap_script"' EXIT
+printf '%s' '${payload}' | base64 --decode | gzip -dc > "$bootstrap_script"
+actual_checksum=$(sha256sum "$bootstrap_script")
+test "$${actual_checksum%% *}" = '${checksum}'
+bash "$bootstrap_script"
