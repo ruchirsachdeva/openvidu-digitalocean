@@ -470,16 +470,46 @@ class AutoscalerSafetyTest(unittest.TestCase):
 
     def test_capacity_drain_replay_and_no_candidate_do_not_issue_new_mutations(self):
         self.autoscaler.SCALE_IN_ENABLED = True
-        self.autoscaler.capacity_request = lambda *args: {}
+        calls = []
+        self.autoscaler.capacity_request = lambda path, payload: calls.append((path, payload)) or {}
         self.autoscaler.tag_res = lambda *args: self.fail("No new tag expected")
         self.autoscaler.untag_res = lambda *args: self.fail("No tag removal expected")
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual("hold", self.autoscaler.reconcile_capacity_drain([node(1, "a")], {"action": "hold"})["body"]["action"])
-            self.autoscaler.capacity_request = lambda *args: {
+            self.assertEqual("hold", self.autoscaler.reconcile_capacity_drain(
+                [node(1, "a"), node(2, "b")], {"action": "hold"})["body"]["action"])
+            self.autoscaler.capacity_request = lambda path, payload: calls.append((path, payload)) or {
                 "dropletId": "2", "nodeId": "b", "generation": "boot",
                 "applicationExcluded": True, "applicationObligationsClear": False}
             self.assertEqual("scale-in-capacity", self.autoscaler.reconcile_capacity_drain(
                 [node(1, "a"), node(2, "b", ["draining"])], {})["body"]["action"])
+        self.assertEqual(['claim-drain', 'claim-drain'], [path for path, _ in calls])
+        self.assertTrue(all(payload['allocatedDropletIds'] == ['1', '2'] for _, payload in calls))
+
+    def test_capacity_at_or_below_floor_does_not_claim_drain_or_report_provisioning_failure(self):
+        for minimum, count in ((1, 0), (1, 1), (2, 1), (2, 2)):
+            with self.subTest(allocated=count, minimum=minimum):
+                self.autoscaler = load_autoscaler()
+                claim, _, writes, _ = self.capacity_setup(False, count=count)
+                claim.update(intentId=None, nodeName=None)
+                self.autoscaler.MIN_NODES = minimum
+                self.autoscaler.SCALE_IN_ENABLED = True
+                calls, signals = [], []
+                def authority(path, payload):
+                    calls.append(path)
+                    if path == 'claim': return claim
+                    if path == 'alert':
+                        signals.append(payload['code']); return {}
+                    self.fail('Floor-sized fleet must not request drain authority')
+                self.autoscaler.capacity_request = authority
+                self.autoscaler.tag_res = lambda *args: self.fail('No cloud drain tag expected')
+                self.autoscaler.untag_res = lambda *args: self.fail('No cloud tag removal expected')
+                result = self.invoke()
+                self.assertEqual('hold', result['action'])
+                self.assertEqual('Fleet at minimum; no scale-in requested', result['warning'])
+                self.assertNotIn('error', result)
+                self.assertEqual(['claim', 'alert'], calls)
+                self.assertEqual(['READINESS_RECOVERED'], signals)
+                self.assertEqual([], writes)
 
     def test_scale_in_disabled_holds_low_cpu_even_above_maximum(self):
         for count in (2, 5):

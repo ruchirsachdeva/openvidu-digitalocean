@@ -1604,6 +1604,11 @@ def reconcile_capacity_drain(inventory, result, maximum=None):
     if not SCALE_IN_ENABLED:
         result["warning"] = "Capacity mode holds automatic scale-in: switch disabled"
         return finish(result)
+    # Inventory includes draining allocations. Retiring a target requires at
+    # least MIN_NODES other ready allocations, including for a retained replay.
+    if len(inventory) <= MIN_NODES:
+        result["warning"] = "Fleet at minimum; no scale-in requested"
+        return finish(result)
     # The authority excludes the exact incarnation atomically with reservation checks.
     # This is permission to BEGIN graceful drain, never permission to delete the VM.
     receipt = capacity_request("claim-drain", {

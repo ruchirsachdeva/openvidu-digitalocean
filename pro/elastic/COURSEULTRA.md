@@ -1,5 +1,16 @@
 # CourseUltra OpenVidu Elastic Deployment
 
+## Hold scale-in at the allocated floor — November 12
+
+Skip the automatic drain-authority request when the complete allocated media
+inventory is at or below the configured minimum. That inventory includes draining
+targets; a valid drain replay still requires the minimum ready peers plus its
+target. An unavailable, unnecessary claim can otherwise produce a provisioning
+failure alert during an operator hold even though no server creation was attempted.
+Above the floor, exact authority claims, retained drain replay, uncertain outcomes
+and tag-delivery checks retain their existing behavior. Alert classification,
+backend state, action parameters and startup payload are unchanged.
+
 ## Recorder observation and recovery-alert compatibility — November 12
 
 Recorder endpoint ownership now tolerates unrelated host processes disappearing
