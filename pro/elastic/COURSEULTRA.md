@@ -1,5 +1,28 @@
 # CourseUltra OpenVidu Elastic Deployment
 
+## Recorder observation and recovery-alert compatibility — November 12
+
+Recorder endpoint ownership now tolerates unrelated host processes disappearing
+and non-listening descriptors closing during enumeration. Both original listening
+sockets must still belong to one live process with unchanged PID birth and
+container identity at the final check; dead/reused owners and changed or closed
+endpoints hold readiness. Fleet logs include the original observation time,
+Droplet ID and bounded backend hold reason to distinguish a superseded frame
+from incomplete recorder evidence, without logging work or credential details.
+
+Autoscaler alerts now include integer epoch-millisecond `observedAt`, as required
+by the backend's ordered incident/recovery contract. Missing source time previously
+caused recovery delivery to fail even after a successful readiness check. Deploy
+the shared backend's source-time handling before the Function update. The existing
+six-code safety fixture checks that paired payload strictly. Allocation, action
+parameters, recorder configuration and lifecycle authority remain unchanged. These
+changes do not resolve an unknown or active recording's capacity hold.
+These changes are locally verified source candidates, not a live migration.
+The representative bootstrap fixture retains at least 1KiB of reviewed headroom
+under the provider's hard 64KiB limit. Render the complete actual private profile
+and credentials before any action update and require the same 1KiB margin; the
+fixture alone does not qualify arbitrary live settings.
+
 ## Compatible false-alarm mitigation qualification — October 28
 
 The deployed backend `145afac8` already accepts the six alert codes used by the

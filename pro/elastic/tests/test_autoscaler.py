@@ -313,6 +313,21 @@ class AutoscalerReadResilienceTest(unittest.TestCase):
 
 
 class AutoscalerSafetyTest(unittest.TestCase):
+    def test_alert_payload_has_integer_source_time_without_changing_action_result(self):
+        scaler = load_autoscaler()
+        scaler.CAPACITY_ENABLED = True
+        calls = []
+        scaler.capacity_request = lambda path, payload: calls.append((path, payload))
+        with patch.object(scaler.time, 'time', return_value=1794441600.123):
+            result = scaler.finish(dict(action='hold', readiness_verified=True))["body"]
+        self.assertEqual([('alert', dict(stack='test-stack', code='READINESS_RECOVERED',
+                                       observedAt=1794441600123))], calls)
+        self.assertIs(type(calls[0][1]['observedAt']), int)
+        self.assertEqual('hold', result['action'])
+        self.assertTrue(result['readiness_verified'])
+        self.assertNotIn('alert_delivery_failed', result)
+        self.assertNotIn('observedAt', result)
+
     def test_readiness_wait_and_recovery_are_not_provisioning_failure(self):
         scaler = load_autoscaler()
         scaler.CAPACITY_ENABLED = True

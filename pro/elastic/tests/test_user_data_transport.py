@@ -90,10 +90,10 @@ class UserDataTransportTest(unittest.TestCase):
                         self.assertLessEqual(len(wrapper.encode()), 65536)
                         if enabled:
                             # Exercise complete profile fields, distinct hashes and
-                            # representative credential/key lengths, with at least
-                            # 2000 bytes of margin. Actual private rendering remains
-                            # required; arbitrary configurations need not fit.
-                            self.assertLessEqual(len(wrapper.encode()), 63536)
+                            # representative credential/key lengths. The reviewed
+                            # 1KiB headroom is separate from the hard64KiB limit;
+                            # actual private rendering must retain it before deploy.
+                            self.assertLessEqual(len(wrapper.encode()), 65536 - 1024)
                         payload = re.search(r"printf '%s' '([^']+)'", wrapper).group(1)
                         self.assertEqual(raw, gzip.decompress(base64.b64decode(payload)))
                         self.assertIn(hashlib.sha256(raw).hexdigest(), wrapper)

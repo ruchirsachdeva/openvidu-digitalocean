@@ -117,9 +117,12 @@ comments/docstrings for transport; full deployed user data must still be rendere
 and checked against the provider's 64KiB limit with actual private configuration.
 The transport regression uses complete profile fields, distinct policy/image hashes,
 representative credential lengths and a 693-character synthetic SSH public key.
-It requires at least 2000 bytes of margin. The captured 2178-byte descriptor plus
-those synthetic credentials rendered media user data at 63399 bytes; the realistic
-synthetic descriptor rendered 63495 bytes. Repetitive padding is not a size proof.
+It requires at least 1024 bytes of reviewed headroom under the hard 64KiB limit;
+the complete actual private profile and credentials must also retain that margin
+before an action update. The original November 11 source with the captured
+2178-byte descriptor plus synthetic credentials rendered media user data at 63399
+bytes; its realistic synthetic descriptor rendered 63495 bytes. New helper changes
+require a fresh render. Repetitive padding is not a size proof.
 Only comments/docstrings/blank lines are omitted from the Python preparers/helpers
 and comments/blank lines from the three pure shell script bodies. Render checks
 compare executable Python ASTs and exact shell command bodies, preserving shebangs

@@ -1,8 +1,8 @@
-"""Temporary Function-only mitigation against the deployed 145afac8 contract.
+"""Original alert-code safety after the backend-first source-time rollout.
 
-This checkout deliberately stops at d631570. The later recovery-code/timestamp
-changes require the shared backend first; passing these tests does not qualify
-paired recovery delivery on the legacy process-local alert implementation.
+The same six codes now carry the integer observation time required by the shared
+backend. These source contracts do not certify real incident/recovery email
+delivery or qualify the old145afac8 process-local alert implementation.
 """
 import contextlib
 import io
@@ -12,8 +12,8 @@ from unittest.mock import Mock
 from test_autoscaler import load_autoscaler
 
 
-class LegacyAlertCompatibilityTest(unittest.TestCase):
-    # Exact enum accepted by the deployed backend, not a simulated new engine.
+class AlertProtocolCompatibilityTest(unittest.TestCase):
+    # Keep the existing code family while enforcing the deployed shared protocol.
     ACCEPTED_CODES = frozenset({
         'ACCOUNT_DROPLET_QUOTA_PRESSURE', 'PROVISIONING_FAILED', 'CAPACITY_WAITING',
         'DELIVERY_CHECK', 'READINESS_UNAVAILABLE', 'READINESS_RECOVERED',
@@ -23,11 +23,13 @@ class LegacyAlertCompatibilityTest(unittest.TestCase):
         self.scaler = load_autoscaler()
         self.scaler.CAPACITY_ENABLED = True
         self.callbacks = []
-        self.scaler.capacity_request = self.legacy_callback
+        self.scaler.capacity_request = self.backend_callback
 
-    def legacy_callback(self, path, payload):
+    def backend_callback(self, path, payload):
         self.assertEqual('alert', path)
-        self.assertEqual({'stack', 'code'}, set(payload))
+        self.assertEqual({'stack', 'code', 'observedAt'}, set(payload))
+        self.assertIs(type(payload['observedAt']), int)
+        self.assertGreater(payload['observedAt'], 0)
         self.assertEqual('test-stack', payload['stack'])
         self.assertIn(payload['code'], self.ACCEPTED_CODES)
         self.callbacks.append(payload['code'])
@@ -52,7 +54,7 @@ class LegacyAlertCompatibilityTest(unittest.TestCase):
     def test_healthy_account_and_capacity_do_not_emit_new_recovery_enum_values(self):
         self.finish({'readiness_verified': True, 'waiting_for_capacity': False,
                      'account_quota': 25, 'account_droplets': 4})
-        # Legacy READINESS_RECOVERED resets its debounce without sending email.
+        # Delivery policy belongs to the paired backend, not this Function.
         self.assertEqual(['READINESS_RECOVERED'], self.callbacks)
 
     def test_failed_or_unknown_mutation_cannot_emit_a_readiness_clear(self):

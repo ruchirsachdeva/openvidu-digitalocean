@@ -127,32 +127,62 @@ def endpoint_owner(container, ports, proc=Path('/proc')):
     """Bind both host-network listening sockets to one exact recorder process."""
     if not re.fullmatch('[a-f0-9]{64}', container) or len(set(ports)) != 2:
         raise ValueError('Exact container and distinct endpoints required')
+    def process(pid):
+        if (pid / 'comm').read_text().strip() != 'egress':
+            return None
+        fields = (pid / 'stat').read_text().rsplit(')', 1)[1].split()
+        if fields[0] in ('Z', 'X', 'x'):
+            return None
+        if not fields[19].isdecimal() or int(fields[19]) <= 0:
+            raise ValueError('Live recorder process required')
+        return fields[19], (pid / 'cgroup').read_text()
+
+    def listeners(pid):
+        found = set()
+        for table in ('tcp', 'tcp6'):
+            for line in (pid / 'net' / table).read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 10 and fields[3] == '0A':
+                    port = int(fields[1].rsplit(':', 1)[1], 16)
+                    if port in ports:
+                        found.add((port, 'socket:[' + fields[9] + ']'))
+        return found
+
     owners = []
     for pid in proc.iterdir():
         if not pid.name.isdecimal():
             continue
         try:
-            if (pid / 'comm').read_text().strip() != 'egress' or container not in (pid / 'cgroup').read_text():
+            identity = process(pid)
+            if identity is None or container not in identity[1]:
                 continue
-            sockets = {os.readlink(fd) for fd in (pid / 'fd').iterdir()}
-            found = set()
-            for table in ('tcp', 'tcp6'):
-                for line in (pid / 'net' / table).read_text().splitlines()[1:]:
-                    fields = line.split()
-                    if len(fields) < 10 or fields[3] != '0A':
-                        continue
-                    port = int(fields[1].rsplit(':', 1)[1], 16)
-                    if port in ports and 'socket:[' + fields[9] + ']' in sockets:
-                        found.add(port)
-            if found == set(ports):
-                # /proc stat's command may contain spaces: fields after final ')' start at field3.
-                start = (pid / 'stat').read_text().rsplit(')', 1)[1].split()[19]
-                owners.append((pid.name, start))
+            endpoints = listeners(pid)
+            owned = {}
+            for fd in (pid / 'fd').iterdir():
+                try:
+                    target = os.readlink(fd)
+                except FileNotFoundError:
+                    # Closed connections are irrelevant only if BOTH original
+                    # listeners retain their exact live owner at the final check.
+                    continue
+                if any(target == value for _, value in endpoints):
+                    owned[fd] = target
+            if {port for port, target in endpoints if target in owned.values()} == set(ports):
+                owners.append((pid, identity, endpoints, owned))
         except FileNotFoundError:
-            raise ValueError('Recorder process changed during observation') from None
+            # A disappearing host task or non-owning egress handler cannot
+            # substitute for the both-port owner positively rechecked below.
+            continue
     if len(owners) != 1:
         raise ValueError('Exact recorder endpoint ownership unavailable')
-    return owners[0]
+    pid, identity, endpoints, owned = owners[0]
+    try:
+        if (any(os.readlink(fd) != target for fd, target in owned.items())
+                or listeners(pid) != endpoints or process(pid) != identity):
+            raise ValueError('Recorder endpoint ownership changed during observation')
+    except FileNotFoundError:
+        raise ValueError('Recorder endpoint ownership changed during observation') from None
+    return pid.name, identity[0]
 
 
 def admission_metrics(body, allow_draining=False):

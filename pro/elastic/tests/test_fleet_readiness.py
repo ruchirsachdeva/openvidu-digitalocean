@@ -55,6 +55,25 @@ def policy():
 
 
 class FleetReadinessTest(unittest.TestCase):
+    def test_summary_retains_original_sample_time_and_safe_hold_reason(self):
+        local = dict(dropletId='123', recorderAdmissionVerified=True)
+        original = '2026-11-12T00:17:49.200932+00:00'
+        for reason in (None, 'fleet_frame_superseded', 'recorder_footprint_incomplete'):
+            with self.subTest(reason=reason):
+                value = fleet.report_summary(dict(poolPublished=False, holdReason=reason), local, original)
+                self.assertEqual(dict(receiptAccepted=True, poolPublished=False, recorderAdmissionVerified=True,
+                                      holdReason=reason, dropletId='123', observedAt=original), value)
+
+    def test_summary_never_echoes_arbitrary_backend_text_or_work_fields(self):
+        local = dict(dropletId='123', recorderAdmissionVerified=False)
+        for reason in ('credential=private-value', 'hold\nprivate-value', 'x' * 81, {}, True):
+            with self.subTest(reason=reason):
+                value = fleet.report_summary(dict(poolPublished='true', holdReason=reason, token='private-value',
+                                                  recorderAction=dict(work='private-value')), local, 'original')
+                self.assertEqual('unrecognized_hold', value['holdReason'])
+                self.assertFalse(value['poolPublished'])
+                self.assertNotIn('private-value', json.dumps(value))
+
     def test_collector_publishes_admission_separately_from_worker_health(self):
         source = (ROOT / 'report-fleet-readiness.py').read_text()
         self.assertIn("admission = admission_metrics(get(ports[1], '/metrics'), allow_draining=journal is not None)", source)

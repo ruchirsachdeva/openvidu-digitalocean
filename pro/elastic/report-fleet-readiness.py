@@ -251,6 +251,16 @@ def container_identities(values):
                    tuple(sorted(json.dumps(m, sort_keys=True) for m in v.get('Mounts', [])))) for v in values)
 
 
+def report_summary(result, local, observed_at):
+    # Log bounded reason codes, never arbitrary backend response text or work details.
+    reason = result.get('holdReason')
+    if reason is not None and (not isinstance(reason, str) or not re.fullmatch('[a-z][a-z0-9_]{0,79}', reason)):
+        reason = 'unrecognized_hold'
+    return dict(receiptAccepted=True, poolPublished=result.get('poolPublished') is True,
+                recorderAdmissionVerified=local['recorderAdmissionVerified'], holdReason=reason,
+                dropletId=local['dropletId'], observedAt=observed_at)
+
+
 def main(settings_path):
     if os.geteuid() != 0:
         raise ValueError('Root collector required')
@@ -329,8 +339,7 @@ def main(settings_path):
             return request(settings['url'].rstrip('/') + '/webhooks/openvidu/capacity/' + path, settings['token'],
                            body if method == 'POST' else None)
         isolation.apply_response(result, local, boot, ROOT, recorder, run, settlement_request)
-    print(json.dumps({'receiptAccepted': True, 'poolPublished': result.get('poolPublished') is True,
-                      'recorderAdmissionVerified': local['recorderAdmissionVerified']}))
+    print(json.dumps(report_summary(result, local, began)))
 
 
 if __name__ == '__main__':

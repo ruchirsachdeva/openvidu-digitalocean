@@ -1470,7 +1470,8 @@ def finish(result):
         for code in sorted(codes, key=lambda code: (code not in (
                 "PROVISIONING_FAILED", "READINESS_UNAVAILABLE", "READINESS_RECOVERED"), code)):
             try:
-                capacity_request("alert", {"stack": STACK_NAME, "code": code})
+                capacity_request("alert", {"stack": STACK_NAME, "code": code,
+                                           "observedAt": int(time.time() * 1000)})
             except Exception:
                 # Delivery failure is visible and retried next activation, but must not
                 # repeat a cloud create or lose a durable provisioning outcome.
